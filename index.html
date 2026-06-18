@@ -477,6 +477,7 @@
   /* Show/hide helpers — used to swap inline diagram for the detailed one in print */
   .print-only { display: none; }
   #detailPrintRoot { display: none; }
+  .print-qr-page { display: none; }
   .screen-only { display: block; }
 
   /* Print
@@ -664,6 +665,17 @@
     }
     .print-only.print-detail-sub  svg.array-diagram { max-height: 175mm !important; }
     .print-only.print-detail-line svg.array-diagram { max-height: 250mm !important; }
+    /* QR on prints: a dedicated page AFTER the diagram — big scannable QR + array specs. */
+    .print-qr-page { display: flex !important; align-items: center; gap: 14mm; padding: 8mm 6mm;
+      page-break-before: always; break-before: page; }
+    .print-qr-page .pq-left { text-align: center; flex: 0 0 auto; }
+    .print-qr-page .pq-img { width: 80mm; height: 80mm; image-rendering: pixelated; display: block; }
+    .print-qr-page .pq-cap { font-size: 10px; color: #444; margin-top: 3mm; max-width: 80mm; }
+    .print-qr-page .pq-info { font-size: 13px; color: #000; }
+    .print-qr-page .pq-title { font-size: 20px; font-weight: 700; margin: 0 0 8px; }
+    .print-qr-page .pq-row { display: flex; gap: 10px; padding: 4px 0; border-bottom: 1px solid #ddd; }
+    .print-qr-page .pq-k { color: #555; min-width: 34mm; }
+    .print-qr-page .pq-v { font-weight: 600; }
 
     /* The SVG inherits the page-level LIGHT theme palette, so racks render as
        light-grey cards, amp/sub blocks render light with colored borders, and
@@ -4259,6 +4271,47 @@ function openQrModal(){
   document.getElementById('qrModal').classList.remove('hidden');
 }
 function closeQrModal(){ document.getElementById('qrModal').classList.add('hidden'); }
+// Build a full PRINT PAGE: a large scannable QR + the array's name and key specs, placed
+// on its own page after the diagram. Scan it on-site to open the interactive viewer.
+function makeViewerQrPage(sa){
+  if (!sa || typeof qrcode === 'undefined') return null;
+  let dataUrl;
+  try { const qr = qrcode(0, 'M'); qr.addData(buildViewerLink(sa)); qr.make(); dataUrl = qr.createDataURL(8, 2); }
+  catch(e){ return null; }
+  let calc = {}; try { calc = calcSubArray(sa) || {}; } catch(e){}
+  const g = calc.geometry || {};
+  const cabs = (calc.subList || []).length;
+  const stacks = (calc.stackCount != null) ? calc.stackCount : (sa.stackCount || 0);
+  const arrLabel = (typeof SUB_ARRANGEMENTS !== 'undefined' && SUB_ARRANGEMENTS[sa.arrangement] && SUB_ARRANGEMENTS[sa.arrangement].label) || sa.arrangement || '';
+  const wiring = (calc.wiringMode && calc.wiringMode.label) ? calc.wiringMode.label.split('—')[0].trim() : (sa.wiringMode || '');
+  const racks = (sa.rackIds || []).map(id => { const r = (state.racks || []).find(x => x.id === id); return r ? r.name : null; }).filter(Boolean);
+  const rows = [];
+  const add = (k, v) => { if (v != null && v !== '') rows.push([k, v]); };
+  add('Box type', sa.boxType);
+  add('Layout', (arrLabel ? arrLabel + ' ' : '') + '× ' + stacks + ' stack' + (stacks === 1 ? '' : 's'));
+  if (wiring) add('Wiring', wiring);
+  if (cabs) add('Cabinets', String(cabs));
+  if (typeof calc.channelsTotal === 'number') add('Channels', String(calc.channelsTotal));
+  if (typeof calc.ampCount === 'number') add('Amplifiers', calc.ampCount + '× ' + (calc.ampType || sa.ampType || ''));
+  if (typeof g.arrayWidthM === 'number') add('Array width', g.arrayWidthM.toFixed(2) + ' m');
+  if (typeof g.centers === 'number') add('Centers / gap', g.centers.toFixed(2) + ' m / ' + (g.gap != null ? g.gap.toFixed(2) : '?') + ' m');
+  if (racks.length) add('Racks', racks.join(', '));
+  const page = el('div', { class: 'print-qr-page' });
+  const left = el('div', { class: 'pq-left' });
+  left.appendChild(el('img', { src: dataUrl, alt: 'QR', class: 'pq-img' }));
+  left.appendChild(el('div', { class: 'pq-cap' }, 'Scan to open the interactive diagram on your phone'));
+  page.appendChild(left);
+  const info = el('div', { class: 'pq-info' });
+  info.appendChild(el('div', { class: 'pq-title' }, sa.name || 'Sub array'));
+  rows.forEach(([k, v]) => {
+    const row = el('div', { class: 'pq-row' });
+    row.appendChild(el('div', { class: 'pq-k' }, k));
+    row.appendChild(el('div', { class: 'pq-v' }, v));
+    info.appendChild(row);
+  });
+  page.appendChild(info);
+  return page;
+}
 
 function defaultState() {
   return {
@@ -8321,7 +8374,7 @@ function renderSubArrayCard(sa, idx) {
   diagBlock.appendChild(screenWrap);
   // Detailed (front view + beziers) — print only.
   // Tagged `.print-detail-sub` so print CSS gives it landscape orientation + own page.
-  const printWrap = el('div', { class: 'print-only print-detail-sub' });
+  const printWrap = el('div', { class: 'print-only print-detail-sub', 'data-print-sub-id': sa.id });
   printWrap.appendChild(el('h3', { style: 'margin:0 0 6px' }, 'Cable route (detailed)'));
   printWrap.appendChild(renderSubDetailedDiagram(sa, calc));
   diagBlock.appendChild(printWrap);
@@ -13285,6 +13338,8 @@ function printDetailOnly() {
   clone.classList.remove('highlight-active');
   root.innerHTML = '';
   root.appendChild(clone);
+  const _pqr = (window._currentDetailKind === 'sub') ? makeViewerQrPage(window._currentDetailSubArray) : null;
+  if (_pqr) root.appendChild(_pqr);
   document.body.classList.add('print-detail-only', landscape ? 'pd-land' : 'pd-port');
   const cleanup = () => {
     document.body.classList.remove('print-detail-only', 'pd-land', 'pd-port');
@@ -13363,6 +13418,13 @@ window.addEventListener('beforeprint', () => {
     d.dataset._prevOpen = d.open ? '1' : '0';
     d.open = true;
   });
+  // Inject a scannable QR into each sub-array detail print page (full-report print).
+  document.querySelectorAll('.print-detail-sub[data-print-sub-id]').forEach(wrap => {
+    if (wrap.querySelector('.print-qr-page')) return;
+    const sa = (state.subArrays || []).find(s => s.id === wrap.getAttribute('data-print-sub-id'));
+    const qrb = sa && makeViewerQrPage(sa);
+    if (qrb) wrap.appendChild(qrb);
+  });
 });
 window.addEventListener('afterprint', () => {
   document.body.classList.remove('is-printing');
@@ -13370,6 +13432,7 @@ window.addEventListener('afterprint', () => {
     if (d.dataset._prevOpen === '0') d.open = false;
     delete d.dataset._prevOpen;
   });
+  document.querySelectorAll('.print-detail-sub .print-qr-page').forEach(q => q.remove());
 });
 
 // Initial render — or, if opened from a QR/deep-link, the standalone mobile viewer.
