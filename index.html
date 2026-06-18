@@ -346,10 +346,12 @@
   @media (hover: hover) {
     svg.array-diagram [data-pair],
     svg.array-diagram [data-bundle] { cursor: pointer; }
-    svg.array-diagram.highlight-active [data-pair]:not(.pair-active),
-    svg.array-diagram.highlight-active [data-bundle]:not(.pair-active) {
-      opacity: 0.12;
-    }
+  }
+  /* Dim non-selected elements when a pair/bundle is active. OUTSIDE @media(hover)
+     so it also works on touch devices (tap-to-highlight in the phone viewer). */
+  svg.array-diagram.highlight-active [data-pair]:not(.pair-active),
+  svg.array-diagram.highlight-active [data-bundle]:not(.pair-active) {
+    opacity: 0.12;
   }
   @media print {
     svg.array-diagram.highlight-active [data-pair]:not(.pair-active),
