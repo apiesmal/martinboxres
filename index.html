@@ -1050,7 +1050,7 @@
           <button class='ghost' id='btnDetailZoomFit' title='Fit to screen' style='padding:2px 8px;min-width:44px'><span id='detailZoomLabel'>Fit</span></button>
           <button class='ghost' id='btnDetailZoomIn' title='Zoom in' style='padding:2px 9px;font-size:15px;line-height:1'>+</button>
         </div>
-        <button class="ghost" id="btnQrDetail" title="Toon een QR-code / link om dit diagram op je telefoon te openen" style="padding:2px 10px">📱 QR</button>
+        <button class="ghost" id="btnQrDetail" title="Show a QR code / link to open this diagram on your phone" style="padding:2px 10px">📱 QR</button>
         <button class="ghost" id="btnPrintDetail" title="Print only this diagram (orientation auto-fits the layout)" style="padding:2px 10px">🖨 Print</button>
         <button class="ghost" id="btnCloseDiagram" aria-label="close">✕</button>
       </div>
@@ -1066,24 +1066,24 @@
 <div class="modal-backdrop hidden" id="qrModal">
   <div class="modal" style="max-width:430px;width:92%">
     <div class="modal-header">
-      <h2>📱 Open op telefoon</h2>
+      <h2>📱 Open on phone</h2>
       <button class="ghost" id="btnCloseQr" aria-label="close">✕</button>
     </div>
     <div class="modal-body" style="text-align:center">
       <img id="qrImg" alt="QR-code" style="width:280px;height:280px;image-rendering:pixelated;background:#fff;padding:10px;border-radius:8px;max-width:100%">
       <div id="qrInfo" style="font-size:12px;color:var(--text-muted);margin-top:8px"></div>
       <div style="text-align:left;margin-top:14px">
-        <label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px">Basis-URL — waar dit bestand online staat. Leeg/lokaal = de QR opent alleen op deze computer.</label>
+        <label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px">Base URL — where this file is hosted. Empty/local = the QR opens only on this computer.</label>
         <input type="text" id="qrBaseUrl" style="width:100%;box-sizing:border-box" placeholder="https://...">
         <label style="font-size:12px;color:var(--text-muted);display:block;margin:10px 0 4px">Link</label>
         <div style="display:flex;gap:6px">
           <input type="text" id="qrLink" readonly style="flex:1;min-width:0" onclick="this.select()">
-          <button class="ghost" id="btnQrCopy">Kopieer</button>
+          <button class="ghost" id="btnQrCopy">Copy</button>
         </div>
       </div>
     </div>
     <div class="modal-footer">
-      <button id="btnDoneQr" class="primary">Klaar</button>
+      <button id="btnDoneQr" class="primary">Done</button>
     </div>
   </div>
 </div>
@@ -4191,7 +4191,7 @@ function renderViewerMode(){
   const root = document.getElementById('viewerRoot');
   if (!root) return;
   const sa = state.subArrays && state.subArrays[0];
-  if (!sa){ root.innerHTML = '<div class="viewer-empty">Geen sub-array in de link.</div>'; return; }
+  if (!sa){ root.innerHTML = '<div class="viewer-empty">No sub-array in this link.</div>'; return; }
   const calc = calcSubArray(sa);
   root.innerHTML = '';
   const hdr = el('div', { class: 'viewer-hdr' });
@@ -4199,10 +4199,10 @@ function renderViewerMode(){
   const bits = [];
   if (sa.boxType) bits.push(sa.boxType);
   const nCabs = (calc && calc.subList) ? calc.subList.length : null;
-  if (nCabs) bits.push(nCabs + ' kasten');
-  if (calc && typeof calc.channelsTotal === 'number') bits.push(calc.channelsTotal + ' kan.');
+  if (nCabs) bits.push(nCabs + ' cabs');
+  if (calc && typeof calc.channelsTotal === 'number') bits.push(calc.channelsTotal + ' ch');
   if (bits.length) hdr.appendChild(el('div', { class: 'viewer-sub' }, bits.join(' · ')));
-  hdr.appendChild(el('div', { class: 'viewer-hint' }, '💡 Tik op een kabel of kast om ’m te markeren · knijp om te zoomen'));
+  hdr.appendChild(el('div', { class: 'viewer-hint' }, '💡 Tap a cable or cab to highlight it · pinch to zoom'));
   root.appendChild(hdr);
   const wrap = el('div', { class: 'viewer-svg-wrap' });
   wrap.appendChild(renderSubDetailedDiagram(sa, calc));
@@ -4214,7 +4214,7 @@ function enterViewerMode(payloadStr){
   document.body.classList.add('viewer-mode');
   const decoded = decodeViewerState(payloadStr);
   if (!decoded || !decoded.sub){
-    if (root) root.innerHTML = '<div class="viewer-empty">Kon de diagram-link niet lezen.</div>';
+    if (root) root.innerHTML = '<div class="viewer-empty">Could not read the diagram link.</div>';
     return true;
   }
   state = buildViewerState(decoded);
@@ -4237,19 +4237,19 @@ function refreshQrModal(){
   const img = document.getElementById('qrImg');
   const info = document.getElementById('qrInfo');
   const linkEl = document.getElementById('qrLink');
-  if (!sa){ if(info) info.textContent = 'Open eerst een sub-array detail.'; return; }
+  if (!sa){ if(info) info.textContent = 'Open a sub-array detail first.'; return; }
   let link;
-  try { link = buildViewerLink(sa); } catch(e){ if(info) info.textContent = 'Kon de link niet bouwen.'; return; }
+  try { link = buildViewerLink(sa); } catch(e){ if(info) info.textContent = 'Could not build the link.'; return; }
   if (linkEl) linkEl.value = link;
   try {
     const qr = qrcode(0, 'M');
     qr.addData(link); qr.make();
     if (img){ img.src = qr.createDataURL(5, 4); img.style.display = ''; }
     const ver = (qr.getModuleCount() - 17) / 4;
-    if (info) info.textContent = 'QR v' + ver + ' \u00b7 ' + link.length + ' tekens \u00b7 scan met je telefoon';
+    if (info) info.textContent = 'QR v' + ver + ' \u00b7 ' + link.length + ' chars \u00b7 scan with your phone';
   } catch(e){
     if (img) img.style.display = 'none';
-    if (info) info.textContent = 'Te groot voor \u00e9\u00e9n QR (' + link.length + ' tekens) \u2014 gebruik de link hieronder.';
+    if (info) info.textContent = 'Too large for one QR (' + link.length + ' chars) \u2014 use the link below.';
   }
 }
 function openQrModal(){
@@ -9163,7 +9163,32 @@ function renderSubDetailedDiagram(sa, calc) {
   // reclaim almost all of this band (removes the empty bottom whitespace, #6).
   const anyBelowDoorlus = calc.pairs.some(p =>
     p.subs.length === 2 && !(!isPortrait && p.subs[0].stackIdx === p.subs[1].stackIdx));
-  const loopThroughZoneH = anyBelowDoorlus ? (layers * loopThroughLaneH + 10) : (compact ? 6 : 8);
+  // Horizontal loop-through lanes: greedy interval colouring on each below-the-array
+  // loop's STACK-INDEX span, so nested mirror loops nest without overlap (inner =
+  // closest to the row, outer = furthest) and adjacent loops share the closest lane.
+  // (Was layer-based — every same-layer mirror loop piled on one lane and overlapped.)
+  const _hLoopLane = new Map();
+  let _hLoopMaxLanes = 0;
+  {
+    const _ivs = pairData
+      .filter(pd => pd.pair && pd.pair.subs && pd.pair.subs.length === 2
+        && !(!isPortrait && pd.pair.subs[0].stackIdx === pd.pair.subs[1].stackIdx))
+      .map(pd => { const a = pd.pair.subs[0].stackIdx, b = pd.pair.subs[1].stackIdx;
+        return { idx: pd.laneIdx, lo: Math.min(a, b), hi: Math.max(a, b), span: Math.abs(a - b) }; })
+      .sort((p, q) => p.span - q.span || p.lo - q.lo);
+    const _placed = [];
+    _ivs.forEach(it => {
+      const used = new Set();
+      for (const q of _placed) { if (it.lo < q.hi && q.lo < it.hi) used.add(q.lane); }
+      let lane = 0; while (used.has(lane)) lane++;
+      it.lane = lane; _placed.push(it); _hLoopLane.set(it.idx, lane);
+    });
+    _hLoopMaxLanes = _placed.reduce((m, it) => Math.max(m, it.lane + 1), 0);
+  }
+  const _hLoopStep = loopThroughLaneH * 0.6;
+  const loopThroughZoneH = anyBelowDoorlus
+    ? (Math.max(layers, _hLoopMaxLanes) * _hLoopStep + 12)
+    : (compact ? 6 : 8);
   // Geometry labels: shown when cross-stack jumpers exist (mirror, F portrait adjacent,
   // cardioid portrait per-layer adjacent, OR sequential cross-link with ≥2 stacks).
   // Phase A 2026-05-30: sequential mode now computes geometry too, so SXH218 etc.
@@ -10553,7 +10578,10 @@ function renderSubDetailedDiagram(sa, calc) {
       return;
     }
     const layerIdx = subA.layerIdx;            // both subs in same layer for mirror; for sequential could differ
-    const baseLane = loopThroughBaseY + (layerIdx + 1) * loopThroughLaneH * 0.5 + (layers - 1 - layerIdx) * 2;
+    // Lane from the interval-colouring above (inner→closest, outer→furthest); nested
+    // mirror loops no longer overlap. Falls back to layerIdx if not mapped.
+    const _hLane = _hLoopLane.has(pd.laneIdx) ? _hLoopLane.get(pd.laneIdx) : layerIdx;
+    const baseLane = loopThroughBaseY + (_hLane + 1) * _hLoopStep;
     // 2026-06-06: per-pair user drag override for the loop-through lane Y.
     const _dlOv = (sa.cableOverrides && sa.cableOverrides.pairs && sa.cableOverrides.pairs[pd.laneIdx]) || {};
     const _doorlusLaneYOff = +_dlOv.doorlusLaneYOff || 0;
@@ -13274,7 +13302,7 @@ document.getElementById('qrModal').addEventListener('click', (e) => { if (e.targ
 document.getElementById('qrBaseUrl').addEventListener('input', (e) => { if (!state.settings) state.settings = {}; state.settings.viewerBaseUrl = e.target.value.trim(); saveState(); refreshQrModal(); });
 document.getElementById('btnQrCopy').addEventListener('click', () => {
   const l = document.getElementById('qrLink'); if (!l) return; l.select();
-  const done = () => { if (typeof toast === 'function') toast('Link gekopieerd'); };
+  const done = () => { if (typeof toast === 'function') toast('Link copied'); };
   if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(l.value).then(done, () => { try { document.execCommand('copy'); done(); } catch(_){} });
   else { try { document.execCommand('copy'); done(); } catch(_){} }
 });
