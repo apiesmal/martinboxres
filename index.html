@@ -746,7 +746,9 @@
   <div class="topbar-buttons">
     <button class="primary" id="btnAddArray">+ Array</button>
     <button class="primary" id="btnAddSubArray" title="Add a sub array (SXH218 / SXHF218)">+ Sub Array</button>
+    <button class="primary" id="btnAddFills" title="Add a fill set — loose speakers (frontfills etc.), each fed by its own tail from the rack">+ Fills</button>
     <button id="btnRacks" title="Amp racks">🎛 Racks</button>
+    <button id="btnAutoAssign" title="Auto-assign racks — pick which racks may be used and distribute them across all arrays automatically">⚡ Auto-assign</button>
     <button id="btnOverview" title="Project overview — rack utilisation across all arrays">📊 Overview</button>
     <button id="btnCopy" title="Copy as text">📋 Copy</button>
     <button id="btnSaveJson" title="Download JSON">💾 Save</button>
@@ -777,6 +779,21 @@
 </main>
 
 <!-- Settings modal -->
+<!-- 2026-07-05: auto rack-assign modal -->
+<div class="modal-backdrop hidden" id="autoAssignModal">
+  <div class="modal" style="max-width:640px">
+    <div class="modal-header">
+      <h2>⚡ Auto-assign racks</h2>
+      <button class="ghost" id="btnCloseAutoAssign" aria-label="close">✕</button>
+    </div>
+    <div class="modal-body" id="autoAssignBody"></div>
+    <div class="modal-footer">
+      <button id="btnAutoAssignApply" class="primary">Apply</button>
+      <button id="btnAutoAssignCancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <!-- 2026-07-03: DISPLAY 3 (.d3) import preview modal -->
 <div class="modal-backdrop hidden" id="d3ImportModal">
   <div class="modal" style="max-width:680px">
@@ -4071,6 +4088,32 @@ function defaultArray() {
   };
 }
 
+// Fill set (2026-07-04) — loose speakers (frontfills, out-fills) that are NOT a
+// hang: each fill gets its own tail from the rack, no box-to-box link cables
+// within a hang. Lives in state.arrays with kind:'fill'; calcArray and
+// renderArrayCard branch on the kind.
+function defaultFillSet() {
+  return {
+    id: 'arr_' + Math.random().toString(36).slice(2, 9),
+    kind: 'fill',
+    name: 'Frontfills',
+    boxType: 'WPS',
+    fillsPerChannel: 1,                  // 1 = own channel; 2 = pairs share (parallel link)
+    ampType: 'iK42',
+    ampDistanceM: 15,                    // default tail length when a fill has no own dist
+    fills: [                             // one entry per loose speaker
+      { name: 'FF1', distM: null, delayMs: 0, gainDb: 0, pos: null },
+      { name: 'FF2', distM: null, delayMs: 0, gainDb: 0, pos: null }
+    ],
+    rackIds: [],
+    rackConnectors: emptyTrunkMap(),
+    rackConnectorsFanIn: {},
+    rackChannelOverrides: {},
+    rackJackAssignments: {},
+    rackDistances: {}
+  };
+}
+
 // Sub array — separate kind from line-array. Empty by default; user adds stacks via UI.
 function defaultSubArray() {
   const def = DEFAULT_SUB_TYPES.SXH218;
@@ -4593,9 +4636,12 @@ function computeProjectRackAllocation() {
   // Each item produces a totalCh and walks its rackIds the same way.
   const items = [
     ...(state.arrays || []).map(a => ({
-      kind: 'line',
+      kind: a.kind === 'fill' ? 'fill' : 'line',
       ref: a,
-      totalCh: (() => {
+      totalCh: a.kind === 'fill'
+        // 2026-07-04 fill sets: 1 channel per fillsPerChannel fills, no biamp.
+        ? Math.ceil(((a.fills || []).length) / Math.max(1, Math.min(2, Math.round(+a.fillsPerChannel) || 1)))
+        : (() => {
         const def = DEFAULT_BOX_TYPES[a.boxType];
         if (!def) return 0;
         const channelsPerGroup = def.biamp ? 2 : 1;
@@ -4673,8 +4719,101 @@ function computeProjectRackAllocation() {
   };
 }
 
+// === Fill set calc (2026-07-04) =============================================
+// Channels = ceil(fills / fillsPerChannel). Cable list: one NL4 tail per
+// channel group to its first fill (per-fill dist override, else ampDistanceM)
+// plus a parallel link cable to the second fill when fillsPerChannel = 2
+// (length from D3 positions when available). Amp patch via the project rack
+// allocation, same as the other array kinds.
+function calcFillSet(fs) {
+  const result = {
+    valid: true, warnings: [], errors: [], groups: [],
+    channelsTotal: 0, ampCount: 0, cableList: [], ampPatch: [],
+    racks: [], rackContributions: [], fillChannels: []
+  };
+  const def = DEFAULT_BOX_TYPES[fs.boxType];
+  const fills = fs.fills || [];
+  if (!def) { result.valid = false; result.errors.push(`Unknown box type: ${fs.boxType}`); return result; }
+  if (!fills.length) { result.valid = false; result.errors.push('No fills — set a count.'); return result; }
+  const fpc = Math.max(1, Math.min(2, Math.round(+fs.fillsPerChannel) || 1));
+  const channels = Math.ceil(fills.length / fpc);
+  result.channelsTotal = channels;
+  const amp = AMP_TYPES[fs.ampType] || { channels: 4 };
+  const ampCh = amp.channels || 4;
+  result.ampCount = Math.ceil(channels / ampCh);
+  result.racks = (fs.rackIds || []).map(rid => (state.racks || []).find(r => r.id === rid)).filter(Boolean);
+
+  // Channel slots from the project rack allocation (rack order), direct amps as fallback.
+  const perArray = (window._projectAllocation && window._projectAllocation.perArray) || {};
+  const myAlloc = perArray[fs.id] || {};
+  const slots = [];
+  (fs.rackIds || []).forEach(rid => {
+    const rack = (state.racks || []).find(r => r.id === rid);
+    const seg = myAlloc[rid];
+    if (!rack || !seg || !(seg.channels > 0)) return;
+    for (let c = seg.startCh; c <= seg.endCh && slots.length < channels; c++) {
+      slots.push({
+        rackName: rack.name,
+        ampLabel: `${fs.ampType}#${Math.floor((c - 1) / ampCh) + 1}`,
+        channelLabel: `ch${((c - 1) % ampCh) + 1}`
+      });
+    }
+  });
+  if (result.racks.length && slots.length < channels) {
+    result.warnings.push(`Assigned rack(s) provide only ${slots.length} of ${channels} needed channels.`);
+  }
+  for (let k = slots.length; k < channels; k++) {
+    slots.push({ rackName: null, ampLabel: `${fs.ampType}#${Math.floor(k / ampCh) + 1}`, channelLabel: `ch${(k % ampCh) + 1}` });
+  }
+
+  // NL4 panel-feed sanity check (light touch — fills don't join the trunk model).
+  if (result.racks.length) {
+    const nl4Ports = result.racks.reduce((sum, r) => sum + ((r.panels || {}).nl4_dual || 0) + ((r.panels || {}).nl4_single || 0), 0);
+    if (nl4Ports < channels) result.warnings.push(`${channels}× NL4 feed needed but rack panel(s) list ${nl4Ports}× NL4 — check panel capacity (shared with other arrays).`);
+  }
+
+  // Cables + patch per channel group.
+  const lens = (state.settings.cableLengths && state.settings.cableLengths.length) ? state.settings.cableLengths : [1, 1.5, 3, 5, 7.5, 10, 15, 20, 25];
+  const slack = +state.settings.cableSlackFactor || 1.15;
+  const term = +state.settings.cableTerminationSlackM || 0.5;
+  const pdist = (a, b) => (a && b && isFinite(a.x) && isFinite(b.x))
+    ? Math.sqrt(Math.pow(a.x - b.x, 2) + Math.pow(a.y - b.y, 2) + Math.pow((a.z || 0) - (b.z || 0), 2)) : null;
+  const agg = new Map();
+  const addCable = (role, len, label) => {
+    const k = role + '|' + len;
+    if (!agg.has(k)) agg.set(k, { type: 'NL4', length: len, count: 0, role, label });
+    agg.get(k).count++;
+  };
+  let maxLenWarned = false;
+  for (let g = 0; g < channels; g++) {
+    const grpFills = fills.slice(g * fpc, g * fpc + fpc);
+    const f1 = grpFills[0];
+    const slot = slots[g];
+    const idxs = grpFills.map((_, j) => g * fpc + j);
+    idxs.forEach(fi => result.fillChannels[fi] = slot);
+    const d1 = (+f1.distM > 0) ? +f1.distM : (+fs.ampDistanceM || 15);
+    const tail = pickCableLength(d1 * slack + term, lens);
+    if (tail < d1 * slack + term && !maxLenWarned) { result.warnings.push('Some tails exceed the longest cable in Settings — longest length used.'); maxLenWarned = true; }
+    addCable('fill-tail', tail, `${tail}m NL4 rack → fill (tail)`);
+    if (grpFills.length === 2) {
+      const geo = pdist(grpFills[0].pos, grpFills[1].pos);
+      const link = pickCableLength((geo != null ? geo : 5) * slack + term, lens);
+      addCable('fill-link', link, `${link}m NL4 fill → fill (parallel link)`);
+    }
+    result.ampPatch.push({
+      ampLabel: slot.ampLabel, channelLabel: slot.channelLabel, rackName: slot.rackName,
+      boxes: idxs.map(fi => fi + 1),
+      fillNames: grpFills.map(fl => fl.name || ''),
+      channelsConsumed: 1, biamp: false
+    });
+  }
+  result.cableList = [...agg.values()];
+  return result;
+}
+
 // Main calculation per array.
 function calcArray(arr) {
+  if (arr.kind === 'fill') return calcFillSet(arr);
   const result = {
     valid: true,
     warnings: [],
@@ -7312,7 +7451,214 @@ function appendRackConnectorsMixFields(form, arr, onChange) {
   }
 }
 
+/* === Fill set card (2026-07-04) =============================================
+   Compact card for loose speakers: box type / count / fills-per-channel /
+   amp / default distance / rack chips, a per-fill table (name, channel,
+   dist, delay, gain — the DSP columns come from DISPLAY 3 import but stay
+   editable), and the usual cable + amp-patch result blocks. */
+function renderFillSetCard(fs, idx) {
+  const calc = calcArray(fs);   // routes to calcFillSet
+  const onChange = (key, val) => { fs[key] = val; saveState(); renderAll(); };
+  const card = el('div', { class: 'array-card', 'data-array-id': fs.id });
+  if (!renderArrayCard._collapsed) renderArrayCard._collapsed = new Map();
+  const isCollapsed = !!renderArrayCard._collapsed.get(fs.id);
+
+  const header = el('div', { class: 'array-card-header' });
+  header.appendChild(el('button', {
+    class: 'ghost', title: isCollapsed ? 'Expand' : 'Collapse', style: 'min-width:26px',
+    onclick: () => { renderArrayCard._collapsed.set(fs.id, !isCollapsed); renderAll(); }
+  }, isCollapsed ? '▶' : '▼'));
+  header.appendChild(el('input', {
+    type: 'text', class: 'array-name', value: fs.name,
+    onchange: (e) => onChange('name', e.target.value)
+  }));
+  header.appendChild(el('span', {
+    style: 'font-size:10.5px;background:var(--raised);color:var(--text-muted);padding:2px 7px;border-radius:8px;font-weight:700;letter-spacing:0.4px'
+  }, 'FILL SET'));
+  header.appendChild(el('button', { class: 'ghost', title: 'Duplicate', onclick: () => duplicateArray(idx) }, '📑'));
+  header.appendChild(el('button', { class: 'ghost', title: 'Delete', onclick: () => deleteArray(idx) }, '🗑'));
+  card.appendChild(header);
+  if (isCollapsed) {
+    card.appendChild(el('div', { style: 'font-size:12px;color:var(--text-muted);padding:2px 6px' },
+      `${(fs.fills || []).length}× ${fs.boxType} · ${calc.channelsTotal} ch`));
+    return card;
+  }
+
+  // --- form row ---
+  const form = el('div', { style: 'display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin:8px 0' });
+  const fld = (labelTxt, input) => el('label', { style: 'display:flex;flex-direction:column;gap:3px;font-size:11.5px;color:var(--text-muted)' }, labelTxt, input);
+  const boxSel = el('select', {
+    onchange: (e) => onChange('boxType', e.target.value)
+  }, ...Object.keys(DEFAULT_BOX_TYPES).map(k => el('option', { value: k, selected: fs.boxType === k ? '' : null }, DEFAULT_BOX_TYPES[k].label || k)));
+  form.appendChild(fld('Box type', boxSel));
+  form.appendChild(fld('Fills', el('input', {
+    type: 'number', min: '1', max: '32', step: '1', value: (fs.fills || []).length, style: 'width:60px',
+    onchange: (e) => {
+      const n = Math.max(1, Math.min(32, parseInt(e.target.value) || 1));
+      const next = (fs.fills || []).slice(0, n);
+      while (next.length < n) next.push({ name: `Fill ${next.length + 1}`, distM: null, delayMs: 0, gainDb: 0, pos: null });
+      onChange('fills', next);
+    }
+  })));
+  form.appendChild(fld('Per channel', el('select', {
+    title: '1 = each fill on its own amp channel; 2 = pairs share a channel via a parallel link cable',
+    onchange: (e) => onChange('fillsPerChannel', parseInt(e.target.value) || 1)
+  }, el('option', { value: '1', selected: (+fs.fillsPerChannel || 1) === 1 ? '' : null }, '1 fill / ch'),
+     el('option', { value: '2', selected: +fs.fillsPerChannel === 2 ? '' : null }, '2 fills / ch'))));
+  form.appendChild(fld('Amp', el('select', {
+    onchange: (e) => onChange('ampType', e.target.value)
+  }, ...Object.keys(AMP_TYPES).map(k => el('option', { value: k, selected: fs.ampType === k ? '' : null }, k)))));
+  form.appendChild(fld('Default dist (m)', el('input', {
+    type: 'number', min: '1', step: '1', value: fs.ampDistanceM || 15, style: 'width:64px',
+    title: 'Tail length used for fills without their own dist',
+    onchange: (e) => onChange('ampDistanceM', parseFloat(e.target.value) || 15)
+  })));
+  card.appendChild(form);
+
+  // --- rack assignment: full parity with the other array cards (2026-07-05) —
+  //     same section styling, ch-range/capacity chip, conflict highlight and
+  //     manual start-channel override. Per-rack DIST is deliberately absent:
+  //     fills carry their own per-fill distance in the table below.
+  const rackSection = el('div', {
+    style: 'display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:10px;padding:8px 10px;background:var(--raised);border:1px solid var(--border);border-radius:8px'
+  });
+  rackSection.appendChild(el('span', {
+    style: 'font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;margin-right:4px'
+  }, '🎛 Racks:'));
+  const myAllocF = (window._projectAllocation && window._projectAllocation.perArray[fs.id]) || {};
+  (fs.rackIds || []).forEach(rid => {
+    const r = (state.racks || []).find(x => x.id === rid);
+    const label = r ? r.name : '(deleted)';
+    const seg = myAllocF[rid];
+    const overrideVal = fs.rackChannelOverrides && fs.rackChannelOverrides[rid];
+    const isOverride = typeof overrideVal === 'number' && overrideVal >= 1;
+    const hasConflict = seg && seg.conflict;
+    const chip = el('span', {
+      style: `background:${hasConflict ? 'var(--warn-bg, rgba(255,80,80,0.18))' : 'var(--accent-light)'};color:var(--text);border:1px solid ${hasConflict ? 'var(--warn-text)' : 'var(--border-strong)'};padding:3px 4px 3px 10px;border-radius:14px;font-size:13px;display:inline-flex;align-items:center;gap:6px`
+    });
+    chip.appendChild(document.createTextNode(label));
+    if (seg) {
+      const rangeLbl = seg.channels > 0
+        ? `ch${seg.startCh}–${seg.endCh} / ${seg.capacity}`
+        : `ch—/${seg.capacity}`;
+      chip.appendChild(el('span', {
+        class: 'rack-chip-detail',
+        style: `font-size:11.5px;color:var(--text-muted);background:var(--panel);padding:1px 6px;border-radius:8px${isOverride ? ';color:var(--primary);font-weight:600' : ''}`,
+        title: isOverride ? `Manual override: starts at ch${overrideVal}` : 'Auto-allocated based on order in project'
+      }, rangeLbl + (isOverride ? ' (manual)' : '')));
+    }
+    chip.appendChild(el('input', {
+      type: 'number', min: '1', step: '1',
+      placeholder: seg ? `auto (${seg.startCh})` : 'auto',
+      value: isOverride ? overrideVal : '',
+      title: 'Manual start channel (leave blank for auto)',
+      class: 'rack-chip-detail',
+      style: 'width:54px;padding:1px 4px;font-size:11px;border:1px solid var(--border-strong);background:var(--input-bg);color:var(--text);border-radius:4px;text-align:right',
+      onchange: (e) => {
+        const v = parseInt(e.target.value);
+        const overrides = { ...(fs.rackChannelOverrides || {}) };
+        if (!isFinite(v) || v < 1) delete overrides[rid];
+        else overrides[rid] = v;
+        onChange('rackChannelOverrides', overrides);
+      }
+    }));
+    chip.appendChild(el('button', {
+      class: 'ghost',
+      style: 'padding:0 6px;font-size:13px;line-height:1;border:none;background:transparent;cursor:pointer',
+      title: 'Remove rack',
+      onclick: () => {
+        const overrides = { ...(fs.rackChannelOverrides || {}) };
+        delete overrides[rid];
+        fs.rackChannelOverrides = overrides;
+        onChange('rackIds', (fs.rackIds || []).filter(id => id !== rid));
+      }
+    }, '✕'));
+    rackSection.appendChild(chip);
+  });
+  const availRacksF = (state.racks || []).filter(r => !(fs.rackIds || []).includes(r.id));
+  if (availRacksF.length) {
+    const addSel = el('select', {
+      class: 'rack-add-select',
+      style: 'padding:3px 6px;font-size:13px;border:1px solid var(--border-strong);background:var(--input-bg);color:var(--text);border-radius:4px',
+      onchange: (e) => {
+        if (e.target.value) onChange('rackIds', [...(fs.rackIds || []), e.target.value]);
+      }
+    });
+    addSel.appendChild(el('option', { value: '' }, '+ add rack'));
+    const projAllocFS = window._projectAllocation || computeProjectRackAllocation();
+    availRacksF.forEach(r => {
+      const matching = (r.amps || []).find(a => a.ampType === fs.ampType);
+      const capacity = matching ? matching.count * (AMP_TYPES[fs.ampType]?.channels || 0) : 0;
+      const byRack = (projAllocFS.byRack || {})[r.id];
+      const usedByOthers = Math.max(0, ((byRack && byRack.used) || 0));
+      const free = Math.max(0, capacity - usedByOthers);
+      const lbl = capacity === 0
+        ? `${r.name} (no ${fs.ampType})`
+        : `${r.name} (${free}/${capacity} ch free)`;
+      addSel.appendChild(el('option', { value: r.id }, lbl));
+    });
+    rackSection.appendChild(addSel);
+  } else if (!(state.racks || []).length) {
+    rackSection.appendChild(el('span', { style: 'font-size:12px;color:var(--text-muted)' },
+      'no racks yet — create them via 🎛 Racks in the topbar'));
+  }
+  card.appendChild(rackSection);
+
+  // --- per-fill table (channel is derived; dist/delay/gain editable) ---
+  const _tdF = 'padding:2px 10px 2px 0;border-bottom:1px solid var(--border)';
+  const tbl = el('table', { style: 'border-collapse:collapse;font-size:12.5px;margin:2px 0 6px' });
+  tbl.appendChild(el('tr', null, ...['Fill', 'Amp channel', 'Dist (m)', 'Delay (ms)', 'Gain (dB)'].map(h =>
+    el('th', { style: 'text-align:left;padding:2px 10px 2px 0;color:var(--text-muted);font-weight:600;border-bottom:1px solid var(--border-strong)' }, h))));
+  const numIn = (val, step, ph, cb, w) => el('input', {
+    type: 'number', step: String(step), value: (val == null || val === '') ? '' : val, placeholder: ph,
+    style: `width:${w || 64}px;padding:1px 4px;font-size:12px;border:1px solid var(--border-strong);background:var(--input-bg);color:var(--text);border-radius:4px;text-align:right`,
+    onchange: (e) => { const v = parseFloat(e.target.value); cb(isFinite(v) ? v : null); saveState(); renderAll(); }
+  });
+  (fs.fills || []).forEach((fl, fi) => {
+    const slot = calc.fillChannels[fi];
+    tbl.appendChild(el('tr', null,
+      el('td', { style: _tdF }, el('input', {
+        type: 'text', value: fl.name || `Fill ${fi + 1}`,
+        style: 'width:72px;padding:1px 4px;font-size:12px;border:1px solid var(--border-strong);background:var(--input-bg);color:var(--text);border-radius:4px',
+        onchange: (e) => { fl.name = e.target.value; saveState(); renderAll(); }
+      })),
+      el('td', { style: _tdF }, slot ? `${slot.rackName ? slot.rackName + ' ' : ''}${slot.ampLabel} ${slot.channelLabel}` : '—'),
+      el('td', { style: _tdF }, numIn(fl.distM, 0.5, `${fs.ampDistanceM || 15}`, v => fl.distM = v)),
+      el('td', { style: _tdF }, numIn(fl.delayMs, 0.01, '0', v => fl.delayMs = v || 0)),
+      el('td', { style: _tdF }, numIn(fl.gainDb, 0.1, '0', v => fl.gainDb = v || 0))
+    ));
+  });
+  card.appendChild(tbl);
+  if (fs.d3) card.appendChild(el('p', { style: 'font-size:11px;color:var(--text-muted);margin:0 0 6px' },
+    'Delay/gain columns were imported from DISPLAY 3 (inputDelay/inputGain per fill) and stay editable.'));
+
+  // --- errors / warnings ---
+  calc.errors.forEach(t => card.appendChild(el('div', { style: 'color:var(--danger,#e05555);font-size:12.5px;margin:2px 0' }, '⛔ ' + t)));
+  calc.warnings.forEach(t => card.appendChild(el('div', { style: 'color:var(--warn,#e0a030);font-size:12.5px;margin:2px 0' }, '⚠ ' + t)));
+
+  // --- results: cables + patch ---
+  const resultGrid = el('div', { class: 'result-grid', style: 'display:flex;flex-wrap:wrap;gap:14px' });
+  const cableBlock = el('div', { class: 'result-block' });
+  cableBlock.appendChild(el('h3', null, `Cabling (${calc.channelsTotal} ch)`));
+  const cul = el('ul');
+  calc.cableList.forEach(c => cul.appendChild(el('li', null, `${c.count}× ${c.label}`)));
+  cableBlock.appendChild(cul);
+  const ampBlock = el('div', { class: 'result-block' });
+  ampBlock.appendChild(el('h3', null, calc.racks.length
+    ? `Rack: ${calc.racks.map(r => r.name).join(' + ')} (${calc.channelsTotal} ch)`
+    : `Amp patch (${calc.ampCount}× ${fs.ampType}, ${calc.channelsTotal} ch)`));
+  const aul = el('ul');
+  calc.ampPatch.forEach(p => aul.appendChild(el('li', null,
+    `${p.rackName ? p.rackName + ' ' : ''}${p.ampLabel} ${p.channelLabel} → ${p.fillNames.join(' + ')}${p.fillNames.length > 1 ? ' (parallel)' : ''}`)));
+  ampBlock.appendChild(aul);
+  resultGrid.appendChild(cableBlock);
+  resultGrid.appendChild(ampBlock);
+  card.appendChild(resultGrid);
+  return card;
+}
+
 function renderArrayCard(arr, idx) {
+  if (arr.kind === 'fill') return renderFillSetCard(arr, idx);
   const calc = calcArray(arr);
   const def = DEFAULT_BOX_TYPES[arr.boxType];
 
@@ -12091,7 +12437,7 @@ function renderTotals() {
   // Combined iteration: line arrays + sub arrays. For each, get a calc and a
   // boxType/boxCount pair so totals roll up uniformly.
   const combined = [
-    ...state.arrays.map(a => ({ ref: a, calc: calcArray(a), boxType: a.boxType, boxCount: a.boxCount })),
+    ...state.arrays.map(a => ({ ref: a, calc: calcArray(a), boxType: a.boxType, boxCount: a.kind === 'fill' ? (a.fills || []).length : a.boxCount })),
     ...state.subArrays.map(sa => ({ ref: sa, calc: calcSubArray(sa), boxType: sa.boxType, boxCount: sa.stackCount * (SUB_ARRANGEMENTS[sa.arrangement]?.layers.length || 0) }))
   ];
 
@@ -12186,6 +12532,13 @@ function nextArrayName() {
   return 'Array ' + (state.arrays.length + 1);
 }
 
+// 2026-07-04: add a fill set (loose speakers) — lives in state.arrays, kind:'fill'.
+function addFillSet() {
+  state.arrays.push(defaultFillSet());
+  saveState();
+  renderAll();
+}
+
 function duplicateArray(idx) {
   const orig = state.arrays[idx];
   const copy = {
@@ -12200,6 +12553,7 @@ function duplicateArray(idx) {
     rackJackAssignments: { ...(orig.rackJackAssignments || {}) },
     rackDistances: { ...(orig.rackDistances || {}) }
   };
+  if (orig.kind === 'fill') copy.fills = (orig.fills || []).map(fl => ({ ...fl }));
   state.arrays.splice(idx + 1, 0, copy);
   saveState();
   renderAll();
@@ -12296,7 +12650,19 @@ function exportText() {
   state.arrays.forEach(arr => {
     const calc = calcArray(arr);
     lines.push(`=== ${arr.name} ===`);
-    lines.push(`${arr.boxCount}× ${DEFAULT_BOX_TYPES[arr.boxType]?.label || arr.boxType}, ${arr.resolution}-box res, ${MOUNTING_LABELS[arr.mounting] || arr.mounting}`);
+    if (arr.kind === 'fill') {
+      lines.push(`${(arr.fills || []).length}× ${DEFAULT_BOX_TYPES[arr.boxType]?.label || arr.boxType} fills, ${+arr.fillsPerChannel === 2 ? '2 fills/channel (parallel)' : '1 fill/channel'}`);
+      const dsp = (arr.fills || []).filter(fl => Math.abs(+fl.delayMs || 0) > 0.005 || Math.abs(+fl.gainDb || 0) > 0.005);
+      if (dsp.length) {
+        lines.push('DSP per fill:');
+        (arr.fills || []).forEach((fl, fi) => {
+          const slot = calc.fillChannels[fi];
+          lines.push(`  ${fl.name}: ${slot ? slot.ampLabel + ' ' + slot.channelLabel : '—'} · ${(+fl.gainDb || 0).toFixed(1)} dB · ${(+fl.delayMs || 0).toFixed(2)} ms`);
+        });
+      }
+    } else {
+      lines.push(`${arr.boxCount}× ${DEFAULT_BOX_TYPES[arr.boxType]?.label || arr.boxType}, ${arr.resolution}-box res, ${MOUNTING_LABELS[arr.mounting] || arr.mounting}`);
+    }
     if (calc.racks && calc.racks.length) {
       const connLbl = formatRackOutputUsage(arr.rackConnectors) || '(no connectors picked)';
       const rackNames = calc.racks.map(r => r.name).join(' + ');
@@ -12316,7 +12682,9 @@ function exportText() {
     calc.cableList.forEach(c => lines.push(`  ${c.count}× ${c.label}`));
     lines.push('Patch:');
     calc.ampPatch.forEach(p => {
-      const boxLabel = p.boxes.length === 1 ? `box ${p.boxes[0]}` : `box ${p.boxes[0]}–${p.boxes[p.boxes.length-1]}`;
+      const boxLabel = p.fillNames
+        ? p.fillNames.join(' + ')
+        : (p.boxes.length === 1 ? `box ${p.boxes[0]}` : `box ${p.boxes[0]}–${p.boxes[p.boxes.length-1]}`);
       const bi = p.biamp ? ' (LF/HF)' : '';
       lines.push(`  ${p.ampLabel} ${p.channelLabel}${bi} → ${boxLabel}`);
     });
@@ -12457,6 +12825,151 @@ function handleFile(e) {
 }
 
 /* =========================================================================
+   Auto rack assign — 2026-07-05
+   Distributes a user-selected set of racks across all arrays (line, fill,
+   sub) in project order. Greedy: each array claims channels from the
+   selected racks (matching ampType, capacity-aware) until its need is met.
+   The modal shows a live plan preview before anything is written.
+   ========================================================================= */
+function _arrayChannelNeed(a) {
+  if (a.kind === 'sub') return subArrayTotalChannels(a);
+  if (a.kind === 'fill') {
+    return Math.ceil(((a.fills || []).length) / Math.max(1, Math.min(2, Math.round(+a.fillsPerChannel) || 1)));
+  }
+  const def = DEFAULT_BOX_TYPES[a.boxType];
+  if (!def) return 0;
+  const channelsPerGroup = def.biamp ? 2 : 1;
+  const groupSize = Math.max(1, +a.resolution || 1);
+  return Math.max(1, Math.ceil((+a.boxCount || 1) / groupSize)) * channelsPerGroup;
+}
+
+function _rackCapacityFor(rack, ampType) {
+  const matching = (rack.amps || []).find(x => x.ampType === ampType);
+  return matching ? matching.count * (AMP_TYPES[ampType]?.channels || 0) : 0;
+}
+
+/* Build the assignment plan. selectedIds = racks the user ticked (in
+   state.racks order); reassignAll = also redo arrays that already have racks.
+   Returns { entries: [{arr, kindLabel, need, rackIds, got, kept}], leftover }. */
+function buildAutoAssignPlan(selectedIds, reassignAll) {
+  const selected = (state.racks || []).filter(r => selectedIds.includes(r.id));
+  // remaining capacity per (rackId, ampType) — amps of different types are
+  // independent hardware, so capacity is tracked per type.
+  const usedKey = (rid, at) => rid + '|' + at;
+  const used = {};
+  const items = [
+    ...(state.arrays || []).map(a => ({ arr: a, kindLabel: a.kind === 'fill' ? 'fill set' : 'line array' })),
+    ...(state.subArrays || []).map(a => ({ arr: a, kindLabel: 'sub array' }))
+  ];
+  // Pass 1: arrays that KEEP their assignment consume capacity first.
+  items.forEach(it => {
+    const a = it.arr;
+    it.need = _arrayChannelNeed(a);
+    it.kept = !reassignAll && (a.rackIds || []).length > 0;
+    if (!it.kept) return;
+    let remaining = it.need;
+    (a.rackIds || []).forEach(rid => {
+      const rack = (state.racks || []).find(r => r.id === rid);
+      if (!rack || remaining <= 0) return;
+      const k = usedKey(rid, a.ampType);
+      const free = Math.max(0, _rackCapacityFor(rack, a.ampType) - (used[k] || 0));
+      const take = Math.min(free, remaining);
+      used[k] = (used[k] || 0) + take;
+      remaining -= take;
+    });
+    it.keptGot = it.need - remaining;   // shortfall on kept arrays shows in the preview
+  });
+  // Pass 2: greedy assignment for the rest, racks in selection order.
+  items.forEach(it => {
+    const a = it.arr;
+    if (it.kept) { it.rackIds = [...(a.rackIds || [])]; it.got = it.keptGot != null ? it.keptGot : it.need; return; }
+    it.rackIds = [];
+    let remaining = it.need;
+    selected.forEach(rack => {
+      if (remaining <= 0) return;
+      const k = usedKey(rack.id, a.ampType);
+      const free = Math.max(0, _rackCapacityFor(rack, a.ampType) - (used[k] || 0));
+      if (free <= 0) return;
+      const take = Math.min(free, remaining);
+      used[k] = (used[k] || 0) + take;
+      remaining -= take;
+      it.rackIds.push(rack.id);
+    });
+    it.got = it.need - remaining;
+  });
+  return { entries: items, selected };
+}
+
+function _autoAssignSelectedIds() {
+  return [...document.querySelectorAll('#autoAssignBody input[data-aa-rack]:checked')].map(cb => cb.dataset.aaRack);
+}
+
+function renderAutoAssignModal(keepSelection) {
+  const body = document.getElementById('autoAssignBody');
+  const prevSel = keepSelection ? _autoAssignSelectedIds() : null;
+  const prevRe = keepSelection ? !!(document.getElementById('aaReassign') || {}).checked : false;
+  body.innerHTML = '';
+  if (!(state.racks || []).length) {
+    body.appendChild(el('p', { style: 'color:var(--text-muted)' }, 'No racks defined yet — create them via 🎛 Racks first.'));
+    return;
+  }
+  body.appendChild(el('p', { style: 'font-size:12.5px;color:var(--text-muted);margin:0 0 8px' },
+    'Tick the racks that may be used. Arrays claim channels in project order (top card first); a rack can feed several arrays and an array can span several racks.'));
+  const rackList = el('div', { style: 'display:flex;flex-direction:column;gap:4px;margin-bottom:10px' });
+  (state.racks || []).forEach(r => {
+    const cb = el('input', { type: 'checkbox', 'data-aa-rack': r.id, style: 'margin:0' });
+    cb.checked = prevSel ? prevSel.includes(r.id) : true;
+    cb.addEventListener('change', () => renderAutoAssignModal(true));
+    const ampsLbl = (r.amps || []).map(x => `${x.count}× ${x.ampType} (${x.count * (AMP_TYPES[x.ampType]?.channels || 0)} ch)`).join(', ') || 'no amps';
+    rackList.appendChild(el('label', { style: 'display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer' },
+      cb, el('span', { style: 'font-weight:600;min-width:110px' }, r.name), el('span', { style: 'color:var(--text-muted)' }, ampsLbl)));
+  });
+  body.appendChild(rackList);
+  const reCb = el('input', { type: 'checkbox', id: 'aaReassign', style: 'margin:0' });
+  reCb.checked = prevRe;
+  reCb.addEventListener('change', () => renderAutoAssignModal(true));
+  body.appendChild(el('label', { style: 'display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;margin-bottom:10px' },
+    reCb, 'Also reassign arrays that already have racks (otherwise those keep their current assignment)'));
+  // Live plan preview
+  const plan = buildAutoAssignPlan(_autoAssignSelectedIds(), reCb.checked);
+  window._autoAssignPlan = plan;
+  const prev = el('div', { style: 'border-top:1px solid var(--border);padding-top:8px' });
+  prev.appendChild(el('h3', { style: 'margin:0 0 6px;font-size:13px' }, 'Plan'));
+  plan.entries.forEach(it => {
+    if (!it.need) return;
+    const names = it.rackIds.map(rid => ((state.racks || []).find(r => r.id === rid) || {}).name).filter(Boolean).join(' + ');
+    const ok = it.got >= it.need;
+    prev.appendChild(el('div', { style: `font-size:12.5px;padding:2px 0;color:${ok ? 'var(--text)' : 'var(--warn,#e0a030)'}` },
+      `${it.kept ? '🔒 ' : ''}${it.arr.name} (${it.kindLabel}, ${it.need} ch) → ${names || '—'}` +
+      (ok ? '' : ` ⚠ ${it.need - it.got} ch unplaced`) + (it.kept ? ' (kept)' : '')));
+  });
+  body.appendChild(prev);
+}
+
+function openAutoAssign() {
+  window._projectAllocation = computeProjectRackAllocation();
+  renderAutoAssignModal(false);
+  document.getElementById('autoAssignModal').classList.remove('hidden');
+}
+function closeAutoAssign() { document.getElementById('autoAssignModal').classList.add('hidden'); }
+function applyAutoAssign() {
+  const plan = window._autoAssignPlan;
+  if (!plan) { closeAutoAssign(); return; }
+  let n = 0;
+  plan.entries.forEach(it => {
+    if (it.kept || !it.need) return;
+    it.arr.rackIds = [...it.rackIds];
+    it.arr.rackChannelOverrides = {};   // fresh auto ordering — manual overrides would fight it
+    n++;
+  });
+  closeAutoAssign();
+  window._autoAssignPlan = null;
+  saveState();
+  renderAll();
+  toast(`Racks auto-assigned to ${n} array(s)`);
+}
+
+/* =========================================================================
    DISPLAY 3 (.d3) import — 2026-07-03
    A .d3 file is a ZIP with a YAML "project" entry (Martin Audio DISPLAY 3).
    We read the soundsystem.speakers list: every hang carries name, boxTypeId,
@@ -12528,6 +13041,9 @@ function parseD3Speakers(text) {
       deploymentId: g(/^ {4}deploymentId: (.+)$/m),
       tilt: parseFloat(g(/^ {4}tilt: (.+)$/m) || 'NaN'),
       turn: parseFloat(g(/^ {4}turn: (.+)$/m) || 'NaN'),
+      // 2026-07-04: per-speaker input DSP — used for fill sets (delay/gain per fill).
+      inputGain: parseFloat(g(/^ {4}inputGain: (.+)$/m) || '0') || 0,
+      inputDelay: parseFloat(g(/^ {4}inputDelay: (.+)$/m) || '0') || 0,
       pos: pos ? { x: +pos[1], y: +pos[2], z: +pos[3] } : null
     };
     if (!isSub) {
@@ -12608,7 +13124,7 @@ function mapD3Speaker(sp) {
     count: sp.nCabs,
     mounting: grounded ? 'ground-stack' : 'flown-tour',
     name: (sp.name || sp.boxTypeId || 'D3 import').trim(),
-    d3: { boxTypeId: sp.boxTypeId, frame: sp.frame || null, pos: sp.pos, tilt: sp.tilt, turn: sp.turn, deploymentId: sp.deploymentId },
+    d3: { boxTypeId: sp.boxTypeId, frame: sp.frame || null, pos: sp.pos, tilt: sp.tilt, turn: sp.turn, deploymentId: sp.deploymentId, inputGain: sp.inputGain || 0, inputDelay: sp.inputDelay || 0 },
     note: hit ? null : ('box type "' + sp.boxTypeId + '" not supported by this tool')
   };
   if (sp.kind !== 'subArray') return out;
@@ -12654,7 +13170,9 @@ function openD3ImportModal() {
     row.appendChild(cb);
     row.appendChild(el('span', { style: 'font-weight:600;min-width:120px' }, p.name));
     let desc;
-    if (!p.supported) {
+    if (p.kind === 'fillset') {
+      desc = `${p.boxType} ×${p.count} — fill set (${p.fills.map(fl => fl.name).join(', ')}), one tail per fill`;
+    } else if (!p.supported) {
       desc = `${p.d3.boxTypeId} ×${p.count} — ${p.note}`;
     } else if (p.kind === 'sub') {
       const arrTxt = p.arrangement === 'castellated'
@@ -12682,7 +13200,14 @@ function importD3Proposals() {
   props.forEach((p, i) => {
     const cb = document.getElementById('d3imp_' + i);
     if (!p.supported || !cb || !cb.checked) return;
-    if (p.kind === 'line') {
+    if (p.kind === 'fillset') {
+      const fsn = defaultFillSet();
+      fsn.name = p.name;
+      fsn.boxType = p.boxType;
+      fsn.fills = p.fills.map(fl => ({ name: fl.name, distM: null, delayMs: fl.delayMs || 0, gainDb: fl.gainDb || 0, pos: fl.pos || null }));
+      fsn.d3 = p.d3;
+      state.arrays.push(fsn);
+    } else if (p.kind === 'line') {
       const arr = defaultArray();
       arr.name = p.name; arr.boxType = p.boxType; arr.boxCount = p.count; arr.mounting = p.mounting;
       const bt = DEFAULT_BOX_TYPES[p.boxType];
@@ -12734,11 +13259,43 @@ async function handleD3File(e) {
     const text = await _d3ReadZipEntry(buf, 'project');
     const speakers = parseD3Speakers(text);
     if (!speakers.length) { alert('No hangs/arrays found in this .d3 file.'); return; }
-    window._d3Proposals = speakers.map(mapD3Speaker);
+    window._d3Proposals = buildD3Proposals(speakers);
     openD3ImportModal();
   } catch (err) {
     alert('Could not read .d3 file: ' + err.message);
   }
+}
+
+/* Map parsed D3 speakers to import proposals, grouping loose single-cab hangs
+   into fill sets. Split out of handleD3File so it's unit-testable. */
+function buildD3Proposals(speakers) {
+    let props = speakers.map(mapD3Speaker);
+    // 2026-07-04: group supported single-cab line hangs of the same box type
+    // into ONE fill-set proposal (frontfills etc.) — they're loose speakers,
+    // not hangs, so a fill set models their cabling correctly.
+    const singles = props.filter(p => p.supported && p.kind === 'line' && p.count === 1);
+    const byBox = new Map();
+    singles.forEach(p => { if (!byBox.has(p.boxType)) byBox.set(p.boxType, []); byBox.get(p.boxType).push(p); });
+    byBox.forEach((grp, boxType) => {
+      if (grp.length < 2) return;
+      grp.sort((a, b) => ((a.d3.pos || {}).y || 0) - ((b.d3.pos || {}).y || 0));
+      // Common name prefix (e.g. FF1..FF6 → "FF"), fallback "<box> fills".
+      let prefix = grp[0].name;
+      grp.forEach(p => { while (prefix && !p.name.startsWith(prefix)) prefix = prefix.slice(0, -1); });
+      prefix = prefix.replace(/[\s\d]+$/, '');
+      const fsProposal = {
+        supported: true, kind: 'fillset', boxType,
+        count: grp.length,
+        name: prefix ? `${prefix} fills` : `${boxType} fills`,
+        fills: grp.map(p => ({ name: p.name, pos: p.d3.pos, delayMs: p.d3.inputDelay || 0, gainDb: p.d3.inputGain || 0 })),
+        d3: { grouped: grp.map(p => p.name) },
+        note: null
+      };
+      const firstIdx = props.indexOf(grp[0]);
+      props = props.filter(p => !grp.includes(p));
+      props.splice(firstIdx, 0, fsProposal);
+    });
+    return props;
 }
 
 function toast(msg) {
@@ -13636,10 +14193,16 @@ function renderOverview() {
 
 document.getElementById('btnAddArray').addEventListener('click', addArray);
 document.getElementById('btnAddSubArray').addEventListener('click', addSubArray);
+document.getElementById('btnAddFills').addEventListener('click', addFillSet);
 document.getElementById('btnCopy').addEventListener('click', copyText);
 document.getElementById('btnSaveJson').addEventListener('click', saveJson);
 document.getElementById('btnLoadJson').addEventListener('click', loadJson);
 // 2026-07-03: DISPLAY 3 import
+document.getElementById('btnAutoAssign').addEventListener('click', openAutoAssign);
+document.getElementById('btnCloseAutoAssign').addEventListener('click', closeAutoAssign);
+document.getElementById('btnAutoAssignCancel').addEventListener('click', closeAutoAssign);
+document.getElementById('btnAutoAssignApply').addEventListener('click', applyAutoAssign);
+document.getElementById('autoAssignModal').addEventListener('click', (e) => { if (e.target.id === 'autoAssignModal') closeAutoAssign(); });
 document.getElementById('btnImportD3').addEventListener('click', () => document.getElementById('fileInputD3').click());
 document.getElementById('fileInputD3').addEventListener('change', handleD3File);
 document.getElementById('btnCloseD3Import').addEventListener('click', closeD3Import);
