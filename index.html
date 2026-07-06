@@ -562,6 +562,9 @@
     .screen-only { display: none !important; }
     .print-only { display: block !important; }
     .rack-add-select { display: none !important; }
+    /* 2026-07-03: rack-chip inline edit chrome (start-ch override, dist, arrival
+       inputs + their tiny labels) is noise on paper — the summary chips stay. */
+    input.rack-chip-detail, select.rack-chip-detail, .rack-chip-hide-print { display: none !important; }
 
     /* Inputs + selects → plain text (keeps their value visible). */
     input[type="number"], input[type="text"], select, textarea {
@@ -748,6 +751,7 @@
     <button id="btnCopy" title="Copy as text">📋 Copy</button>
     <button id="btnSaveJson" title="Download JSON">💾 Save</button>
     <button id="btnLoadJson" title="Import JSON">📂 Load</button>
+    <button id="btnImportD3" title="Import a Martin Audio DISPLAY 3 project (.d3) — creates arrays from the hangs in the file">🎯 D3</button>
     <button id="btnPrint" title="Print / PDF">🖨 Print</button>
     <button id="btnFaq" title="FAQ — connectors & wiring explained">❓ FAQ</button>
     <button id="btnSettings" title="Settings">⚙ Settings</button>
@@ -773,6 +777,21 @@
 </main>
 
 <!-- Settings modal -->
+<!-- 2026-07-03: DISPLAY 3 (.d3) import preview modal -->
+<div class="modal-backdrop hidden" id="d3ImportModal">
+  <div class="modal" style="max-width:680px">
+    <div class="modal-header">
+      <h2>🎯 Import DISPLAY 3 project</h2>
+      <button class="ghost" id="btnCloseD3Import" aria-label="close">✕</button>
+    </div>
+    <div class="modal-body" id="d3ImportBody"></div>
+    <div class="modal-footer">
+      <button id="btnD3ImportConfirm" class="primary">Import selected</button>
+      <button id="btnD3ImportCancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-backdrop hidden" id="faqModal">
   <div class="modal">
     <div class="modal-header">
@@ -1108,6 +1127,7 @@
 <div id="viewerRoot"></div>
 
 <input type="file" id="fileInput" accept=".json" hidden>
+<input type="file" id="fileInputD3" accept=".d3" hidden>
 <div class="toast hidden" id="toast"></div>
 
 <script>/* lz-string v1.5.0 (MIT) — compress state for the QR mobile viewer */
@@ -7469,7 +7489,7 @@ function renderArrayCard(arr, idx) {
       }
     });
     chip.appendChild(el('span', {
-      class: 'rack-chip-detail',
+      class: 'rack-chip-detail rack-chip-hide-print',
       style: 'font-size:10.5px;color:var(--text-muted);margin-left:2px'
     }, 'dist'));
     chip.appendChild(distInp);
@@ -8379,8 +8399,52 @@ function renderSubArrayCard(sa, idx) {
   printWrap.appendChild(renderSubDetailedDiagram(sa, calc));
   diagBlock.appendChild(printWrap);
 
+  // === 2026-07-04: DISPLAY 3 beam preset — per-stack gain/delay table ======
+  // Present when this sub-array was imported from a .d3 whose sub pattern
+  // carried beam-steering values. Amp channels resolved via the amp patch so
+  // the tech can dial gain/delay straight into the DSP. Prints with the card.
+  let beamBlock = null;
+  const d3beam = (sa.d3 && Array.isArray(sa.d3.beam)) ? sa.d3.beam : null;
+  if (d3beam && d3beam.length) {
+    beamBlock = el('div', { class: 'result-block' });
+    beamBlock.appendChild(el('h3', null, '🎯 Beam preset (DISPLAY 3)'));
+    // stack → amp-channel labels from the amp patch (stock entries carry
+    // stackIdxs; sequential entries carry box numbers → subList → stackIdx).
+    const stackCh = new Map();
+    (calc.ampPatch || []).forEach(p => {
+      let stacks = (p.stackIdxs && p.stackIdxs.length) ? p.stackIdxs
+        : (p.boxes || []).map(n => (calc.subList[n - 1] || {}).stackIdx).filter(v => v != null);
+      const lbl = `${p.ampLabel || ''} ${p.channelLabel || ''}`.trim();
+      [...new Set(stacks)].forEach(si => {
+        if (!stackCh.has(si)) stackCh.set(si, []);
+        if (lbl && !stackCh.get(si).includes(lbl)) stackCh.get(si).push(lbl);
+      });
+    });
+    const _tdS = 'padding:2px 12px 2px 0;border-bottom:1px solid var(--border)';
+    const tbl = el('table', { style: 'border-collapse:collapse;font-size:12.5px' });
+    tbl.appendChild(el('tr', null,
+      ...['Stack', 'Amp channel(s)', 'Gain', 'Delay'].map(h =>
+        el('th', { style: 'text-align:left;padding:2px 12px 2px 0;color:var(--text-muted);font-weight:600;border-bottom:1px solid var(--border-strong)' }, h))));
+    d3beam.forEach((b, si) => {
+      tbl.appendChild(el('tr', null,
+        el('td', { style: _tdS }, `Stack ${si + 1}`),
+        el('td', { style: _tdS }, (stackCh.get(si) || ['—']).join(', ')),
+        el('td', { style: _tdS + ';text-align:right;font-variant-numeric:tabular-nums' }, `${(+b.gain || 0).toFixed(1)} dB`),
+        el('td', { style: _tdS + ';text-align:right;font-variant-numeric:tabular-nums' }, `${(+b.delay || 0).toFixed(2)} ms`)
+      ));
+    });
+    beamBlock.appendChild(tbl);
+    if (d3beam.length !== sa.stackCount) {
+      beamBlock.appendChild(el('p', { style: 'font-size:11px;color:var(--warn,#e0a030);margin:6px 0 0' },
+        `⚠ Beam values were imported for ${d3beam.length} stacks but the array now has ${sa.stackCount} — re-import from DISPLAY 3 after layout changes.`));
+    }
+    beamBlock.appendChild(el('p', { style: 'font-size:11px;color:var(--text-muted);margin:6px 0 0' },
+      'Per-stack DSP values from the DISPLAY 3 sub pattern (beam steering / arc delay). All cabs in a stack share these settings.'));
+  }
+
   resultGrid.appendChild(cableBlock);
   resultGrid.appendChild(ampBlock);
+  if (beamBlock) resultGrid.appendChild(beamBlock);
   resultGrid.appendChild(diagBlock);
   card.appendChild(resultGrid);
 
@@ -10415,9 +10479,13 @@ function renderSubDetailedDiagram(sa, calc) {
       });
       svg.appendChild(blockGroup);
     } else {
+      // 2026-07-03 fan-out redesign: the generic 3-line glyph is replaced by a
+      // splitter NODE here + per-pair tails that leave the node at the correct
+      // angle toward each destination sub (drawn in the stub pass below).
       fanOut.appendChild(sv('title', null,
         `Sub-side fan-out: 1× ${variantShort} → ${grp.pairs.length}× ${fanType} breakout to speakers`));
-      fanOut.appendChild(fanGlyph(fanOutX, bundleRouteY, _glyphDir, bundleColor, false));
+      fanOut.appendChild(sv('circle', { cx: fanOutX, cy: bundleRouteY, r: compact ? 2.6 : 3.2, fill: bundleColor }));
+      fanOut.appendChild(sv('circle', { cx: fanOutX, cy: bundleRouteY, r: compact ? 4.6 : 5.6, fill: 'none', stroke: bundleColor, 'stroke-width': 1.2, opacity: 0.55 }));
       svg.appendChild(fanOut);
     }
 
@@ -10433,6 +10501,14 @@ function renderSubDetailedDiagram(sa, calc) {
     const _orderedPairs = _useBlock
       ? grp.pairs.slice().sort((a, b) => subCenter(a.pair.subs[0]).x - subCenter(b.pair.subs[0]).x)
       : grp.pairs;
+    // #fanout 2026-07-03: rank pairs by horizontal distance from the fan-out node,
+    // so nearer subs get the steeper/shorter lane — tails fan out without crossing.
+    const _fanRank = new Map();
+    if (!_useBlock && !_useIntermediateBlock) {
+      grp.pairs.slice()
+        .sort((a, b) => Math.abs(subCenter(a.pair.subs[0]).x - fanOutX) - Math.abs(subCenter(b.pair.subs[0]).x - fanOutX))
+        .forEach((pd, i) => _fanRank.set(pd.laneIdx, i));
+    }
     if (!_useIntermediateBlock) _orderedPairs.forEach((pd, kIdx) => {
       const sub0 = pd.pair.subs[0];
       const c0 = subCenter(sub0);
@@ -10454,7 +10530,12 @@ function renderSubDetailedDiagram(sa, calc) {
         stubSock = sock;
         d = `M ${sock.x} ${sock.y} L ${sock.x} ${stubLaneY} L ${stubX} ${stubLaneY} L ${stubX} ${subTopY}`;
       } else {
-        d = `M ${stubX} ${bundleRouteY} L ${stubX} ${subTopY}`;
+        // #fanout 2026-07-03: tail leaves the fan-out node at the correct angle
+        // toward this sub — diagonal to a per-pair lane just below the bundle at
+        // the sub's X, then a vertical drop into the sub.
+        const _fr = _fanRank.get(pd.laneIdx) || 0;
+        const _fanDropY = bundleRouteY + (compact ? 5 : 7) + _fr * (compact ? 2.5 : 3) + _stubLaneYOff;
+        d = `M ${fanOutX} ${bundleRouteY} L ${stubX} ${_fanDropY} L ${stubX} ${subTopY}`;
       }
       const _stubHit = sv('path', {
         d, fill: 'none', stroke: 'transparent', 'stroke-width': 10,
@@ -10855,9 +10936,10 @@ function applyDetailZoom() {
   if (!svg || !body) return;
   const vert = !!(state.settings && state.settings.detailVertical) && window._currentDetailKind !== 'line';
   const ctl = document.getElementById('detailZoomControls');
-  if (ctl) ctl.style.display = vert ? '' : 'none';
-  if (!vert) {
-    // #zoom: horizontal keeps the simple fit-to-width behaviour (manual zoom disabled here).
+  if (ctl) ctl.style.display = '';
+  if (!vert && _detailZoom == null) {
+    // #zoom: horizontal default = fit-to-width; manual zoom (buttons / Ctrl+wheel)
+    // falls through to the pixel-sizing path below (2026-07-03).
     svg.style.width = '100%';
     svg.style.height = 'auto';
     svg.style.maxHeight = 'calc(100vh - 96px)';
@@ -10865,6 +10947,8 @@ function applyDetailZoom() {
     svg.style.marginLeft = '';
     svg.style.marginRight = '';
     svg.style.marginBottom = '';
+    const _lbl0 = document.getElementById('detailZoomLabel');
+    if (_lbl0) _lbl0.textContent = 'Fit';
     return;
   }
   const cb = _detailContentBox();
@@ -11973,12 +12057,15 @@ function openDetailDiagram(arr) {
   titleEl.textContent = `🔍 Detailed cable route — ${arr.name}`;
   const svgEl = renderDetailedDiagram(arr, calc);
   body.appendChild(svgEl);
-  // Line arrays have no vertical layout — hide that toggle (and the sub-only zoom
-  // controls) so it can't be used here, and forget any previously-open sub-array.
+  // Line arrays have no vertical layout — hide that toggle so it can't be used
+  // here, and forget any previously-open sub-array. Zoom controls DO apply
+  // (2026-07-03): default Fit, buttons / Ctrl+wheel switch to manual zoom.
   window._currentDetailKind = 'line';
   window._currentDetailSubArray = null;
   const lblV = document.getElementById('lblDetailVertical'); if (lblV) lblV.style.display = 'none';
-  const ctl = document.getElementById('detailZoomControls'); if (ctl) ctl.style.display = 'none';
+  const ctl = document.getElementById('detailZoomControls'); if (ctl) ctl.style.display = '';
+  _detailZoom = null;
+  const _zl = document.getElementById('detailZoomLabel'); if (_zl) _zl.textContent = 'Fit';
   const qb0 = document.getElementById('btnQrDetail'); if (qb0) qb0.style.display = 'none';
   if (svgEl) { svgEl.style.width = '100%'; svgEl.style.height = 'auto'; svgEl.style.maxHeight = 'calc(100vh - 96px)'; svgEl.style.marginTop = '0'; }
   document.getElementById('diagramModal').classList.remove('hidden');
@@ -12367,6 +12454,291 @@ function handleFile(e) {
   };
   reader.readAsText(file);
   e.target.value = '';
+}
+
+/* =========================================================================
+   DISPLAY 3 (.d3) import — 2026-07-03
+   A .d3 file is a ZIP with a YAML "project" entry (Martin Audio DISPLAY 3).
+   We read the soundsystem.speakers list: every hang carries name, boxTypeId,
+   cabinet count, deploymentId (flown/ground), position (x,y,z), tilt, turn.
+   ZIP inflate uses the native DecompressionStream API (no library).
+   ========================================================================= */
+async function _d3ReadZipEntry(buf, wantName) {
+  const dv = new DataView(buf);
+  const u8 = new Uint8Array(buf);
+  // End-of-central-directory: scan backwards (comment can be up to 64k).
+  let eocd = -1;
+  const minEnd = Math.max(0, buf.byteLength - 65558);
+  for (let i = buf.byteLength - 22; i >= minEnd; i--) {
+    if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error('not a ZIP-based .d3 file');
+  const count = dv.getUint16(eocd + 10, true);
+  let off = dv.getUint32(eocd + 16, true);
+  const td = new TextDecoder();
+  for (let k = 0; k < count; k++) {
+    if (dv.getUint32(off, true) !== 0x02014b50) throw new Error('bad ZIP directory');
+    const method = dv.getUint16(off + 10, true);
+    const csize  = dv.getUint32(off + 20, true);
+    const nlen   = dv.getUint16(off + 28, true);
+    const elen   = dv.getUint16(off + 30, true);
+    const clen   = dv.getUint16(off + 32, true);
+    const lho    = dv.getUint32(off + 42, true);
+    const name   = td.decode(u8.subarray(off + 46, off + 46 + nlen));
+    off += 46 + nlen + elen + clen;
+    if (name !== wantName) continue;
+    const lnlen = dv.getUint16(lho + 26, true);
+    const lelen = dv.getUint16(lho + 28, true);
+    const dstart = lho + 30 + lnlen + lelen;
+    const cdata = u8.slice(dstart, dstart + csize);
+    if (method === 0) return td.decode(cdata);
+    if (method !== 8) throw new Error('unsupported ZIP compression method ' + method);
+    const stream = new Blob([cdata]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+    return await new Response(stream).text();
+  }
+  throw new Error('no "' + wantName + '" entry found inside the .d3 file');
+}
+
+/* Targeted YAML-subset parser: only the soundsystem.speakers section, only the
+   fields we need. Field indents (verified against DISPLAY 3 exports):
+   speaker item "  - !d3obj", speaker fields indent 4, position x/y/z indent 6,
+   connectible fields (boxTypeId / frame libraryId) indent 6, cabinet fields
+   indent 8 (one tiltAngle per cabinet → cabinet count). */
+function parseD3Speakers(text) {
+  const ssIdx = text.search(/^soundsystem:/m);
+  if (ssIdx < 0) throw new Error('no soundsystem section in project');
+  let sec = text.slice(ssIdx);
+  const spIdx = sec.search(/^ {2}speakers:/m);
+  if (spIdx < 0) throw new Error('no speakers in project');
+  sec = sec.slice(spIdx);
+  const bodyStart = sec.indexOf('\n') + 1;
+  const body = sec.slice(bodyStart);
+  const endIdx = body.search(/^ {0,2}\w/m);   // next sibling/top-level key ends the list
+  const listTxt = endIdx >= 0 ? body.slice(0, endIdx) : body;
+  const chunks = listTxt.split(/^ {2}- /m).filter(c => c.trim());
+  // YAML scalars with trailing spaces / special chars come single-quoted — dequote.
+  const dq = (v) => (v && v.length > 1 && v[0] === "'" && v[v.length - 1] === "'")
+    ? v.slice(1, -1).replace(/''/g, "'") : v;
+  return chunks.map(ch => {
+    const g = (re) => { const m = ch.match(re); return m ? dq(m[1].trim()) : null; };
+    const pos = ch.match(/^ {4}position:[^\n]*\n {6}x: ([^\n]+)\n {6}y: ([^\n]+)\n {6}z: ([^\n]+)/m);
+    const isSub = /^ {4}type: [^\n]*'SUB_ARRAY'/m.test(ch);
+    const base = {
+      name: g(/^ {4}name: (.+)$/m),
+      deploymentId: g(/^ {4}deploymentId: (.+)$/m),
+      tilt: parseFloat(g(/^ {4}tilt: (.+)$/m) || 'NaN'),
+      turn: parseFloat(g(/^ {4}turn: (.+)$/m) || 'NaN'),
+      pos: pos ? { x: +pos[1], y: +pos[2], z: +pos[3] } : null
+    };
+    if (!isSub) {
+      return Object.assign(base, {
+        kind: 'lineHang',
+        boxTypeId: g(/^ {6}boxTypeId: (.+)$/m),
+        frame: g(/^ {6}libraryId: ([A-Z0-9_]*FRAME[A-Z0-9_]*)$/m),
+        nCabs: (ch.match(/^ {8}tiltAngle:/mg) || []).length
+      });
+    }
+    // === SUB_ARRAY hang (2026-07-04) ===
+    // Structure: speaker.libraryId = sub model; pattern { class Broadside*/
+    // CastellatedPattern, preset, gap, orientation, kernalItems[].cardioid
+    // (false=F true=B, = the per-stack layer recipe) }; connectibles = one
+    // SubGroup per STACK, each with subs[] (one Loudspeaker per cab).
+    const patClass = (ch.match(/class: com\.martinaudio\.d3\.model\.project\.soundsystem\.sub\.patterns\.(\w+)/) || [])[1] || null;
+    const kernel = (ch.match(/^ {8}cardioid: (true|false)$/mg) || []).map(l => /true/.test(l));
+    // Per-SubGroup cab counts: split the connectibles section on its list items.
+    let groupSizes = [], groupBeam = [];
+    const connIdx = ch.search(/^ {4}connectibles:/m);
+    if (connIdx >= 0) {
+      // 2026-07-04: also capture the per-stack beam values (gain dB / delay ms)
+      // that DISPLAY 3 computes for the sub pattern — SubGroup fields at indent 6.
+      const grps = ch.slice(connIdx).split(/^ {4}- /m).slice(1)
+        .map(grp => ({
+          n: (grp.match(/devices\.Loudspeaker/g) || []).length,
+          gain: parseFloat((grp.match(/^ {6}gain: (.+)$/m) || [])[1]),
+          delay: parseFloat((grp.match(/^ {6}delay: (.+)$/m) || [])[1])
+        }))
+        .filter(g => g.n > 0);
+      groupSizes = grps.map(g => g.n);
+      groupBeam = grps.map(g => ({
+        gain: isFinite(g.gain) ? g.gain : 0,
+        delay: isFinite(g.delay) ? g.delay : 0
+      }));
+    }
+    return Object.assign(base, {
+      kind: 'subArray',
+      boxTypeId: g(/^ {8}libraryId: (.+)$/m) || g(/^ {4}libraryId: (.+)$/m),
+      patternClass: patClass,
+      preset: (g(/^ {6}preset: .*'(\w+)'/m) || 'UNIFORM').toUpperCase(),
+      gap: parseFloat(g(/^ {6}gap: (.+)$/m) || 'NaN'),
+      orientation: /PORTRAIT/.test(ch.match(/^ {6}orientation: (.+)$/m) ? ch.match(/^ {6}orientation: (.+)$/m)[1] : '') ? 'portrait' : 'landscape',
+      kernel,
+      nGroups: groupSizes.length,
+      groupSizes,
+      groupBeam,
+      nCabs: groupSizes.reduce((a, b) => a + b, 0)
+    });
+  }).filter(sp => sp.boxTypeId && sp.nCabs > 0);
+}
+
+/* DISPLAY 3 boxTypeId → this tool's box types. */
+const D3_BOX_TYPE_MAP = {
+  WPL:     { kind: 'line', boxType: 'WPL' },
+  WPC:     { kind: 'line', boxType: 'WPC' },
+  WPS:     { kind: 'line', boxType: 'WPS' },
+  WPM:     { kind: 'line', boxType: 'WPM' },
+  T1215:   { kind: 'line', boxType: 'T1215' },
+  T1230:   { kind: 'line', boxType: 'T1230' },
+  SXH218:  { kind: 'sub', boxType: 'SXH218' },
+  SXHF218: { kind: 'sub', boxType: 'SXHF218' },
+  SX218:   { kind: 'sub', boxType: 'SX218' },
+  'SX218+':{ kind: 'sub', boxType: 'SX218+' },
+  'SX118+':{ kind: 'sub', boxType: 'SX118+' },
+  SXC118:  { kind: 'sub', boxType: 'SXC118' },
+  SXCF118: { kind: 'sub', boxType: 'SXCF118' },
+  SX215:   { kind: 'sub', boxType: 'SX215' }
+};
+
+function mapD3Speaker(sp) {
+  const hit = D3_BOX_TYPE_MAP[(sp.boxTypeId || '').toUpperCase()];
+  const grounded = /ground|stack/i.test(sp.deploymentId || '');
+  const out = {
+    supported: !!hit,
+    kind: hit ? hit.kind : null,
+    boxType: hit ? hit.boxType : null,
+    count: sp.nCabs,
+    mounting: grounded ? 'ground-stack' : 'flown-tour',
+    name: (sp.name || sp.boxTypeId || 'D3 import').trim(),
+    d3: { boxTypeId: sp.boxTypeId, frame: sp.frame || null, pos: sp.pos, tilt: sp.tilt, turn: sp.turn, deploymentId: sp.deploymentId },
+    note: hit ? null : ('box type "' + sp.boxTypeId + '" not supported by this tool')
+  };
+  if (sp.kind !== 'subArray') return out;
+  // === SUB_ARRAY mapping (2026-07-04) ===
+  out.kind = hit ? 'sub' : null;
+  if (hit && hit.kind !== 'sub') { out.supported = false; out.note = '"' + sp.boxTypeId + '" is not a sub in this tool'; return out; }
+  out.mounting = 'ground-stack';
+  out.stackCount = sp.nGroups;
+  out.orientation = sp.orientation;
+  out.d3.pattern = { class: sp.patternClass, preset: sp.preset, gap: sp.gap, kernel: sp.kernel };
+  const _beam = sp.groupBeam || [];
+  out.d3.beam = _beam.some(b => Math.abs(b.gain) > 0.005 || Math.abs(b.delay) > 0.005) ? _beam : null;
+  if (sp.patternClass === 'CastellatedPattern') {
+    out.arrangement = 'castellated';
+    out.castellatedPreset = sp.preset.toLowerCase();          // uniform | bookend | buttress
+    out.castellatedElements = sp.groupSizes.filter(n => n >= 2).length;   // T-count = cardioid stacks
+  } else {
+    // Kernel [F,B,...] → arrangement string 'F+B+…'
+    out.arrangement = sp.kernel.length ? sp.kernel.map(c => c ? 'B' : 'F').join('+') : 'F';
+    // Broadside geometry → arrayWidthM: N stacks × cab width + (N-1) × gap.
+    if (hit && isFinite(sp.gap) && sp.nGroups > 1) {
+      const dims = (DEFAULT_SUB_TYPES[hit.boxType] || {}).dimensions;
+      if (dims && dims.landscape) {
+        const wMm = sp.orientation === 'portrait' ? dims.landscape.h : dims.landscape.w;
+        out.arrayWidthM = Math.round((sp.nGroups * wMm / 1000 + (sp.nGroups - 1) * sp.gap) * 100) / 100;
+      }
+    }
+  }
+  return out;
+}
+
+function openD3ImportModal() {
+  const body = document.getElementById('d3ImportBody');
+  const props = window._d3Proposals || [];
+  body.innerHTML = '';
+  body.appendChild(el('p', { style: 'font-size:12.5px;color:var(--text-muted);margin:0 0 10px' },
+    `Found ${props.length} hang(s) in the DISPLAY 3 project. Tick the ones to import — each becomes a new array in this project (racks unassigned; assign them afterwards). Position / tilt / turn from D3 are stored on the array for future use.`));
+  props.forEach((p, i) => {
+    const row = el('label', { style: 'display:flex;align-items:center;gap:8px;padding:5px 6px;border-bottom:1px solid var(--border);cursor:pointer;font-size:13px' });
+    const cb = el('input', { type: 'checkbox', id: 'd3imp_' + i, style: 'margin:0' });
+    cb.checked = p.supported;
+    cb.disabled = !p.supported;
+    row.appendChild(cb);
+    row.appendChild(el('span', { style: 'font-weight:600;min-width:120px' }, p.name));
+    let desc;
+    if (!p.supported) {
+      desc = `${p.d3.boxTypeId} ×${p.count} — ${p.note}`;
+    } else if (p.kind === 'sub') {
+      const arrTxt = p.arrangement === 'castellated'
+        ? `castellated ${p.castellatedPreset} (${p.castellatedElements} elements)`
+        : `${p.arrangement || 'F'} ×${p.stackCount || p.count} stacks`;
+      desc = `${p.boxType} ×${p.count} cabs — sub array, ${arrTxt}, ${p.orientation || 'landscape'}` +
+        (p.arrayWidthM ? ` · ${p.arrayWidthM}m wide` : '');
+    } else {
+      desc = `${p.boxType} ×${p.count} — line array, ${p.mounting}` +
+        (p.d3.pos ? ` · pos ${p.d3.pos.x.toFixed(1)}/${p.d3.pos.y.toFixed(1)}/${p.d3.pos.z.toFixed(1)}m` : '');
+    }
+    row.appendChild(el('span', { style: 'color:var(--text-muted)' }, desc));
+    body.appendChild(row);
+  });
+  document.getElementById('d3ImportModal').classList.remove('hidden');
+}
+
+function closeD3Import() {
+  document.getElementById('d3ImportModal').classList.add('hidden');
+}
+
+function importD3Proposals() {
+  const props = window._d3Proposals || [];
+  let n = 0;
+  props.forEach((p, i) => {
+    const cb = document.getElementById('d3imp_' + i);
+    if (!p.supported || !cb || !cb.checked) return;
+    if (p.kind === 'line') {
+      const arr = defaultArray();
+      arr.name = p.name; arr.boxType = p.boxType; arr.boxCount = p.count; arr.mounting = p.mounting;
+      const bt = DEFAULT_BOX_TYPES[p.boxType];
+      if (bt && !bt.resolutions.includes(arr.resolution)) arr.resolution = bt.resolutions[0];
+      if (bt && bt.defaultAmp) arr.ampType = bt.defaultAmp;
+      arr.d3 = p.d3;
+      state.arrays.push(arr);
+    } else {
+      const sa = defaultSubArray();
+      sa.name = p.name; sa.boxType = p.boxType;
+      sa.stackCount = p.stackCount || p.count;                 // D3 subs: stacks, not cabs
+      sa.arrangement = 'F';
+      // Same normalisation as the boxType picker in renderSubArrayCard:
+      const def = DEFAULT_SUB_TYPES[p.boxType];
+      if (def) {
+        sa.mounting = def.allowedMountings.includes(p.mounting) ? p.mounting : def.allowedMountings[0];
+        if (!def.allowedAmps.includes(sa.ampType)) sa.ampType = def.defaultAmp;
+        if (!def.wiringModes[sa.wiringMode]) sa.wiringMode = def.defaultWiringMode;
+        // 2026-07-04: D3 SUB_ARRAY carries arrangement / orientation / castellated config.
+        if (p.orientation) sa.orientation = (p.orientation === 'portrait' && def.supportsPortrait) ? 'portrait' : 'landscape';
+        if (p.arrangement === 'castellated' && CASTELLATED_ALLOWED_BOXES.includes(p.boxType)) {
+          sa.arrangement = 'castellated';
+          sa.castellatedPreset = ['uniform', 'bookend', 'buttress'].includes(p.castellatedPreset) ? p.castellatedPreset : 'uniform';
+          sa.castellatedElements = Math.max(2, p.castellatedElements || 2);
+        } else if (p.arrangement && SUB_ARRANGEMENTS[p.arrangement] && p.arrangement !== 'castellated') {
+          sa.arrangement = p.arrangement;
+        }
+        if (def.allowedArrangements && !def.allowedArrangements.includes(sa.arrangement)) sa.arrangement = def.allowedArrangements[0];
+        if (p.arrayWidthM > 0) sa.arrayWidthM = p.arrayWidthM;
+      }
+      sa.d3 = p.d3;
+      state.subArrays.push(sa);
+    }
+    n++;
+  });
+  closeD3Import();
+  window._d3Proposals = null;
+  if (n) { saveState(); renderAll(); }
+  toast(n ? `${n} array(s) imported from DISPLAY 3` : 'Nothing selected');
+}
+
+async function handleD3File(e) {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file) return;
+  try {
+    if (typeof DecompressionStream === 'undefined') throw new Error('this browser lacks DecompressionStream (need Chrome/Edge 80+, Safari 16.4+)');
+    const buf = await file.arrayBuffer();
+    const text = await _d3ReadZipEntry(buf, 'project');
+    const speakers = parseD3Speakers(text);
+    if (!speakers.length) { alert('No hangs/arrays found in this .d3 file.'); return; }
+    window._d3Proposals = speakers.map(mapD3Speaker);
+    openD3ImportModal();
+  } catch (err) {
+    alert('Could not read .d3 file: ' + err.message);
+  }
 }
 
 function toast(msg) {
@@ -13267,6 +13639,13 @@ document.getElementById('btnAddSubArray').addEventListener('click', addSubArray)
 document.getElementById('btnCopy').addEventListener('click', copyText);
 document.getElementById('btnSaveJson').addEventListener('click', saveJson);
 document.getElementById('btnLoadJson').addEventListener('click', loadJson);
+// 2026-07-03: DISPLAY 3 import
+document.getElementById('btnImportD3').addEventListener('click', () => document.getElementById('fileInputD3').click());
+document.getElementById('fileInputD3').addEventListener('change', handleD3File);
+document.getElementById('btnCloseD3Import').addEventListener('click', closeD3Import);
+document.getElementById('btnD3ImportCancel').addEventListener('click', closeD3Import);
+document.getElementById('btnD3ImportConfirm').addEventListener('click', importD3Proposals);
+document.getElementById('d3ImportModal').addEventListener('click', (e) => { if (e.target.id === 'd3ImportModal') closeD3Import(); });
 document.getElementById('fileInput').addEventListener('change', handleFile);
 document.getElementById('btnPrint').addEventListener('click', () => {
   // Temporarily expand all collapsed arrays (line + sub) so the print includes the full content.
