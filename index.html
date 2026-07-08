@@ -3487,12 +3487,20 @@ const DEFAULT_BOX_TYPES = {
            notes: '2×6.5" 2-way passive.' },
   T1215: { label: 'TORUS T1215', biamp: false, resolutions: [1, 2, 3, 4],    torus: true,  defaultAmp: 'iK42',
            limits: { 'flown-tour': 6, 'flown-install': 6, 'ground-stack': 3 }, stackedHardCap: false,
-           jumperLengthM: 0.5,
+           jumperLengthM: 0.5, legacyHidden: true,
            notes: 'Passive constant curvature 15°. NL4 switch 1+/1- or 2+/2-.' },
   T1230: { label: 'TORUS T1230', biamp: false, resolutions: [1, 2, 3, 4],    torus: true,  defaultAmp: 'iK42',
            limits: { 'flown-tour': 6, 'flown-install': 6, 'ground-stack': 3 }, stackedHardCap: false,
+           jumperLengthM: 0.5, legacyHidden: true,
+           notes: 'Passive constant curvature 30°. NL4 switch 1+/1- or 2+/2-.' },
+  // 2026-07-06 (Martijn): T1215 + T1230 merged into ONE T12 array type. A TORUS
+  // hang mixes 15° and 30° cabinets freely; the per-box mix lives in
+  // `arr.torusMix` (array of 'T1215'|'T1230', top → bottom, length = boxCount).
+  // T1215/T1230 stay defined (legacyHidden) so old saves migrate cleanly.
+  T12:   { label: 'TORUS T12 (15°/30° mix)', biamp: false, resolutions: [1, 2, 3, 4], torus: true, defaultAmp: 'iK42',
+           limits: { 'flown-tour': 6, 'flown-install': 6, 'ground-stack': 3 }, stackedHardCap: false,
            jumperLengthM: 0.5,
-           notes: 'Passive constant curvature 30°. NL4 switch 1+/1- or 2+/2-.' }
+           notes: 'Passive constant curvature, mixed 15°/30° cabinets per hang. Rear NL4 switch +1−1 / +2−2 → one NL4d feeds 2 array segments.' }
 };
 
 const MOUNTING_LABELS = {
@@ -3715,6 +3723,13 @@ function subArrayTotalChannels(sa) {
   if (pairing === 'parallelAdjacent') {
     // Cardioid in portrait → per-layer mirror pairing (each layer independent).
     if (isCardioid) {
+      // 2026-07-05: odd stack count + palindromic layers (F+B+F) in portrait —
+      // the middle stack pairs its own mirror layers (L1+L3 share one NL4d, the
+      // middle B stays singleton): floor(stacks/2)×layers + ceil(layers/2) pairs.
+      const _pal = arrange.layers.join('') === arrange.layers.slice().reverse().join('');
+      if (isPortrait && _pal && layers > 1 && stackCount % 2 === 1 && sa.arrangement !== 'castellated') {
+        return pairCountToChannels(Math.floor(stackCount / 2) * layers + Math.ceil(layers / 2));
+      }
       return pairCountToChannels(Math.ceil(stackCount / 2) * layers);
     }
     if (layers < 2) return pairCountToChannels(Math.ceil(stackCount / 2));
@@ -4074,8 +4089,9 @@ function defaultArray() {
     boxType: 'WPC',
     boxCount: 12,
     resolution: 2,
+    torusMix: [],                         // T12 only: per-box 'T1215'|'T1230', top → bottom
     ampType: 'iK42',
-    ampDistanceM: 25,                     // default distance — fallback used when rackDistances[rid] is empty
+    ampDistanceM: 10,                     // default distance (2026-07-06: 25 → 10 per Martijn) — fallback used when rackDistances[rid] is empty
     mounting: 'flown-tour',
     rackIds: [],                          // assigned rack IDs (multi-select)
     rackConnectors: emptyTrunkMap(),      // chosen trunk mix
@@ -4123,13 +4139,15 @@ function defaultSubArray() {
     name: 'Sub Array 1',
     boxType: 'SXH218',
     ampType: 'iK42',                    // pinned for now (only iK42 drives SXH218/SXHF218/SX218)
-    ampDistanceM: 25,
+    ampDistanceM: 5,                    // 2026-07-06: 25 → 5 per Martijn (subs sit close to the racks)
     mounting: 'ground-stack',
     arrangement: 'F',                   // uniform per array in iteration 1
     stackCount: 0,                      // start empty; user must add stacks
     wiringMode: def.defaultWiringMode,  // 'default' for SXH-style, 'stock' / 'modded' for SX218
     orientation: 'landscape',           // 'landscape' | 'portrait' — portrait only for 2-driver subs (supportsPortrait)
-    mirrorOddLayerSingletons: false,    // Optimization: in SX218 stock portrait F+F+F, mirror the odd-layer
+    mirrorOddLayerSingletons: true,     // Optimization: in SX218 stock portrait F+F+F, mirror the odd-layer
+                                        // 2026-07-05: DEFAULT ON per Martijn (~25% channel saving; existing
+                                        // saved arrays keep their stored value via the loadState migration).
                                         // (layer 2) singletons across stacks instead of giving each its own NL4d.
                                         // Saves ~25% amp channels. Long cross-array jumper per pair.
     arrayWidthM: 0,                     // outer width of array (m), used in stock-mode mirror calc
@@ -4495,6 +4513,20 @@ function loadState() {
     });
     // Migrate legacy values per array
     s.arrays.forEach(a => {
+      // 2026-07-06: T1215/T1230 merged into T12 — convert legacy arrays and
+      // keep torusMix in sync with boxCount (extend with the last chosen model).
+      if (a.kind !== 'fill') {
+        if (a.boxType === 'T1215' || a.boxType === 'T1230') {
+          a.torusMix = Array(Math.max(1, +a.boxCount || 1)).fill(a.boxType);
+          a.boxType = 'T12';
+        }
+        if (!Array.isArray(a.torusMix)) a.torusMix = [];
+        if (a.boxType === 'T12') {
+          const n = Math.max(1, +a.boxCount || 1);
+          while (a.torusMix.length < n) a.torusMix.push(a.torusMix[a.torusMix.length - 1] || 'T1215');
+          a.torusMix = a.torusMix.slice(0, n).map(m => (m === 'T1230' ? 'T1230' : 'T1215'));
+        }
+      }
       if (a.mounting === 'flown') a.mounting = 'flown-tour';
       if (!MOUNTING_LABELS[a.mounting]) a.mounting = 'flown-tour';
       // Old single-rack assignment → array form
@@ -5163,19 +5195,39 @@ function calcArray(arr) {
   } else if (assignedRacks.length && totalConnectorCount === 0) {
     result.warnings.push('Rack(s) assigned but no cable connectors picked — set quantities to compute cable list');
   } else {
-    // No rack assigned: direct amp output, 1 NL4 per group
-    result.cableList.push({
-      type: 'NL4',
-      length: tailLength,
-      count: groups.length,
-      role: 'amp-tail',
-      label: `NL4 ${tailLength}m amp → first box`
-    });
+    // No rack assigned: direct amp output, 1 NL4 per group.
+    // 2026-07-06 TORUS: one NL4d carries 2 groups (rear switch) → ceil(groups/2) tails.
+    if (def.torus) {
+      result.cableList.push({
+        type: 'NL4',
+        length: tailLength,
+        count: Math.ceil(groups.length / 2),
+        role: 'amp-tail',
+        label: `NL4d ${tailLength}m amp → array (each feeds 2 segments via rear switch)`
+      });
+    } else {
+      result.cableList.push({
+        type: 'NL4',
+        length: tailLength,
+        count: groups.length,
+        role: 'amp-tail',
+        label: `NL4 ${tailLength}m amp → first box`
+      });
+    }
   }
 
   // Jumpers: per group, (size-1) jumpers — always NL4.
   // Label flags factory-cable variants so the puller knows whether it's a
   // generic NL4 patch or the OEM Wave-series link cable that ships with the box.
+  // 2026-07-06 TORUS: one NL4d feeds TWO consecutive groups (rear switch +1−1 /
+  // +2−2), so every shared pair needs one extra NL4 link between the segments.
+  if (def.torus && groups.length > 1) {
+    const sharedPairs = Math.floor(groups.length / 2);
+    result.cableList.push({
+      type: 'NL4', length: jumperLength, count: sharedPairs, role: 'segment-link',
+      label: `NL4 ${jumperLength}m segment link (2 groups on one NL4d — 2nd segment on switch +2−2)`
+    });
+  }
   const totalJumpers = groups.reduce((sum, size) => sum + Math.max(0, size - 1), 0);
   if (totalJumpers > 0) {
     const isFactory = (typeof def.jumperLengthM === 'number' && def.jumperLengthM > 0);
@@ -5239,6 +5291,10 @@ function calcArray(arr) {
       ? `ch${chWithinAmp}+${chWithinAmp+1}`
       : `ch${chWithinAmp}`;
     result.ampPatch.push({
+      // 2026-07-06 TORUS rear switch: channel parity decides the NL4 pin pair —
+      // even group (1st of an NL4d) listens on +1−1, odd group on +2−2.
+      torusSwitch: def.torus ? (gi % 2 === 0 ? '+1−1' : '+2−2') : undefined,
+      torusNl4d: def.torus ? Math.floor(gi / 2) + 1 : undefined,
       groupIdx: gi,
       ampIdx,
       ampKey,
@@ -5282,10 +5338,13 @@ function calcArray(arr) {
            plays its own audio (forward vs back). Within each layer L, pair
            adjacent stacks (s1+s2, s3+s4, …); odd-count → middle-stack
            singleton on its own NL4d. This keeps cardioid behaviour intact.
-        b) Non-cardioid F-only (F, F+F, F+F+F):
-           - layers≥2: pairs within each stack (layer 0+1 share a cable,
-             layer 2 singleton if odd) — each stack electrically self-contained.
-           - layers=1 (F): pairs adjacent stacks in walk-order.
+        b) Non-cardioid F-only (F+F, F+F+F — layers≥2 ONLY):
+           - pairs within each stack (layer 0+1 share a cable, layer 2
+             singleton if odd) — each stack electrically self-contained.
+           - layers=1 (F) does NOT derive to parallelAdjacent (2026-07-05):
+             single-layer portrait keeps MIRROR pairing — adjacent cabs sit at
+             different arc-delay positions, mirror partners share the same
+             delay, so only mirrors may share a parallel loop-through.
    ========================================================================= */
 function calcSubArray(sa) {
   const result = {
@@ -5354,17 +5413,26 @@ function calcSubArray(sa) {
   // Effective pairing.
   // For chPerCab=2 boxes (SX218 stock, 2 amp ch per cab): portrait derives
   // mirroredPerLayer → parallelAdjacent so that multi-layer stacks pair within-stack
-  // (short jumpers) and F-single pairs adjacent — matches SX218's portrait practice.
+  // (short jumpers, same acoustic position) — matches SX218's portrait practice.
   // For chPerCab=1 boxes (SX215/SX118+ stock): KEEP mirroredPerLayer in portrait
   // — each pair = 1 ch on its own NL4s, mirror across the array is the canonical
   // wiring practice and the trunk model stays clean.
+  // 2026-07-05 fix (Martijn): portrait F (SINGLE layer) also KEEPS mirror pairing.
+  // Every portrait-F stack is one cab at its own position; paralleling ADJACENT
+  // cabs puts two different arc-delay positions on one cable — the delays can't
+  // both be right. Mirror partners (stack k ↔ N−k+1) share identical beam delay,
+  // so parallel loop-through is only electrically honest between mirrors.
+  // Multi-layer F+F(+F) keeps parallelAdjacent: those pair WITHIN a stack
+  // (same position, same delay — fine). Castellated keeps its own path.
   const isPortrait = sa.orientation === 'portrait' && def.supportsPortrait;
   // For castellated, isCardioid is TRUE because T-stacks have B cabs — even though
   // `arr.layers` is just ['F'] (placeholder). Detect via per-stack arrangements.
   const isCardioid = arr.layers.some(l => l === 'B') ||
                      !!(arr.isCastellated && (sa.castellatedPreset && sa.castellatedElements > 0));
   let effectivePairing = mode.pairing;
-  if (isPortrait && effectivePairing === 'mirroredPerLayer' && (mode.chPerCab || 1) === 2) {
+  const _singleLayerF = !isCastellated && !isCardioid && arr.layers.length === 1;
+  if (isPortrait && effectivePairing === 'mirroredPerLayer' && (mode.chPerCab || 1) === 2
+      && !_singleLayerF) {
     effectivePairing = 'parallelAdjacent';
   }
   // 2026-06-06: SX215 stock 4Ω load — each cab on its own NL4s channel, no
@@ -5643,14 +5711,23 @@ function calcSubArray(sa) {
     // which is what installers expect for cardioid F+B configurations.
     // To revert to layer-first (legacy) ordering, swap the outer/inner loops:
     //   outer `for (let L = 0; ...)`, inner mirror-walk over stacks.
+    // 2026-07-05 (Martijn): in PORTRAIT a stack's layers sit SIDE-BY-SIDE, so the
+    // positional mirror of stack i's layer L is stack j's layer (layers−1−L) —
+    // e.g. F+B+F: outer-left F pairs with outer-right F. Only palindromic layer
+    // sequences (F+B+F, F+F, F+F+F) keep matching roles after reversal;
+    // asymmetric ones (F+B) keep same-layer pairing. Landscape keeps same-layer
+    // (layers are stacked vertically at the same x → already exact mirrors).
+    const _revL_m = isPortrait && !isCastellated && layersPerStack > 1 &&
+      arr.layers.join('') === arr.layers.slice().reverse().join('');
     let i = 0, j = stackCount - 1;
     while (i < j) {
       for (let L = 0; L < layersPerStack; L++) {
+        const Lj = _revL_m ? (layersPerStack - 1 - L) : L;
         result.pairs.push({
           pairIdx: result.pairs.length,
           subs: [
             result.subList[i * layersPerStack + L],
-            result.subList[j * layersPerStack + L]
+            result.subList[j * layersPerStack + Lj]
           ],
           trunkType: pairTrunkType,
           layer: L,
@@ -5661,15 +5738,34 @@ function calcSubArray(sa) {
       i++; j--;
     }
     if (i === j) {
-      for (let L = 0; L < layersPerStack; L++) {
-        result.pairs.push({
-          pairIdx: result.pairs.length,
-          subs: [result.subList[i * layersPerStack + L]],
-          trunkType: pairTrunkType,
-          layer: L,
-          mirrorOuterIdx: null,    // singleton — middle stack
-          isStockParallel: true
-        });
+      // 2026-07-05: middle-stack mirror-layer pairing — see the cardioid
+      // parallelAdjacent branch for rationale. Inert today (portrait multi-layer
+      // with chPerCab=1 doesn't exist) but keeps both mirror paths equivalent.
+      if (_revL_m) {
+        for (let L = 0; L < Math.ceil(layersPerStack / 2); L++) {
+          const Lj = layersPerStack - 1 - L;
+          result.pairs.push({
+            pairIdx: result.pairs.length,
+            subs: (Lj === L)
+              ? [result.subList[i * layersPerStack + L]]
+              : [result.subList[i * layersPerStack + L], result.subList[i * layersPerStack + Lj]],
+            trunkType: pairTrunkType,
+            layer: L,
+            mirrorOuterIdx: null,
+            isStockParallel: true
+          });
+        }
+      } else {
+        for (let L = 0; L < layersPerStack; L++) {
+          result.pairs.push({
+            pairIdx: result.pairs.length,
+            subs: [result.subList[i * layersPerStack + L]],
+            trunkType: pairTrunkType,
+            layer: L,
+            mirrorOuterIdx: null,    // singleton — middle stack
+            isStockParallel: true
+          });
+        }
       }
     }
   } else if (effectivePairing === 'parallelAdjacent') {
@@ -5692,14 +5788,20 @@ function calcSubArray(sa) {
       // 2026-06-02 reorder: STACK-FIRST then LAYER-WITHIN-STACK so bundles group
       // a stack's F+B together (see mirroredPerLayer comment). To revert: swap
       // outer/inner loops to layer-first ordering.
+      // 2026-07-05 (Martijn): positional layer mirroring in portrait — see the
+      // mirroredPerLayer comment. F+B+F stack 1 ↔ stack N pairs (L1,L3), (L2,L2),
+      // (L3,L1): outer F with outer F, exact mirror positions, concentric cables.
+      const _revL_c = isPortrait && !isCastellated && layersPerStack > 1 &&
+        arr.layers.join('') === arr.layers.slice().reverse().join('');
       let i = 0, j = stackCount - 1;
       while (i < j) {
         for (let L = 0; L < layersPerStack; L++) {
+          const Lj = _revL_c ? (layersPerStack - 1 - L) : L;
           result.pairs.push({
             pairIdx: result.pairs.length,
             subs: [
               result.subList[i * layersPerStack + L],
-              result.subList[j * layersPerStack + L]
+              result.subList[j * layersPerStack + Lj]
             ],
             trunkType: pairTrunkType,
             layer: L,
@@ -5712,17 +5814,40 @@ function calcSubArray(sa) {
         i++; j--;
       }
       if (i === j) {
-        for (let L = 0; L < layersPerStack; L++) {
-          result.pairs.push({
-            pairIdx: result.pairs.length,
-            subs: [result.subList[i * layersPerStack + L]],
-            trunkType: pairTrunkType,
-            layer: L,
-            mirrorOuterIdx: null,            // middle-stack singleton
-            portraitMirrorPair: true,
-            cardioidMirrorPair: isCardioid,
-            isStockParallel: true
-          });
+        // 2026-07-05 (Martijn): middle stack in odd-count PORTRAIT palindromic
+        // arrangements — its own outer layers are exact mirrors around the array
+        // centre (F+B+F: L1 and L3 both F, equidistant from centre), so they
+        // share one NL4d. Odd middle layer (the B) stays a singleton. Saves
+        // chPerCab channels. Non-palindromic / landscape keep per-layer singletons.
+        if (_revL_c) {
+          for (let L = 0; L < Math.ceil(layersPerStack / 2); L++) {
+            const Lj = layersPerStack - 1 - L;
+            result.pairs.push({
+              pairIdx: result.pairs.length,
+              subs: (Lj === L)
+                ? [result.subList[i * layersPerStack + L]]
+                : [result.subList[i * layersPerStack + L], result.subList[i * layersPerStack + Lj]],
+              trunkType: pairTrunkType,
+              layer: L,
+              mirrorOuterIdx: null,          // middle stack
+              portraitMirrorPair: true,
+              cardioidMirrorPair: isCardioid,
+              isStockParallel: true
+            });
+          }
+        } else {
+          for (let L = 0; L < layersPerStack; L++) {
+            result.pairs.push({
+              pairIdx: result.pairs.length,
+              subs: [result.subList[i * layersPerStack + L]],
+              trunkType: pairTrunkType,
+              layer: L,
+              mirrorOuterIdx: null,            // middle-stack singleton
+              portraitMirrorPair: true,
+              cardioidMirrorPair: isCardioid,
+              isStockParallel: true
+            });
+          }
         }
       }
     } else if (layersPerStack >= 2) {
@@ -7671,6 +7796,13 @@ function renderArrayCard(arr, idx) {
       // Reset amp to default for this type
       arr.ampType = DEFAULT_BOX_TYPES[val]?.defaultAmp || arr.ampType;
     }
+    // 2026-07-06: T12 mix follows boxCount / boxType changes.
+    if (arr.boxType === 'T12' && (key === 'boxCount' || key === 'boxType')) {
+      if (!Array.isArray(arr.torusMix)) arr.torusMix = [];
+      const n = Math.max(1, +arr.boxCount || 1);
+      while (arr.torusMix.length < n) arr.torusMix.push(arr.torusMix[arr.torusMix.length - 1] || 'T1215');
+      arr.torusMix = arr.torusMix.slice(0, n);
+    }
     saveState();
     renderAll();
   };
@@ -7910,11 +8042,49 @@ function renderArrayCard(arr, idx) {
     onchange: (e) => onChange('boxType', e.target.value)
   });
   for (const k of Object.keys(DEFAULT_BOX_TYPES)) {
+    // 2026-07-06: T1215/T1230 are legacy (merged into T12) — hidden from the
+    // picker unless this array still carries one (pre-migration edge case).
+    if (DEFAULT_BOX_TYPES[k].legacyHidden && k !== arr.boxType) continue;
     const opt = el('option', { value: k }, DEFAULT_BOX_TYPES[k].label);
     if (k === arr.boxType) opt.selected = true;
     boxTypeSelect.appendChild(opt);
   }
   form.appendChild(field('Box type', boxTypeSelect));
+
+  // 2026-07-06: T12 hang-mix configurator — one toggle chip per box (top→bottom),
+  // click flips 15° ↔ 30°; presets set the whole hang at once.
+  const buildTorusMixField = () => {
+    const wrap = el('div', { style: 'display:flex;flex-direction:column;gap:4px' });
+    const chipRow = el('div', { style: 'display:flex;flex-wrap:wrap;gap:3px;align-items:center' });
+    const mix = arr.torusMix || [];
+    mix.forEach((m, i) => {
+      const is30 = m === 'T1230';
+      chipRow.appendChild(el('button', {
+        class: 'ghost',
+        title: `Box ${i + 1} (top = box 1): ${is30 ? 'T1230 (30°)' : 'T1215 (15°)'} — click to flip`,
+        style: `padding:2px 7px;font-size:11px;font-weight:700;border-radius:6px;line-height:1.3;` +
+               `border:1px solid ${is30 ? 'var(--primary)' : 'var(--border-strong)'};` +
+               `background:${is30 ? 'var(--accent-light)' : 'var(--input-bg)'};color:var(--text)`,
+        onclick: () => {
+          const next = [...(arr.torusMix || [])];
+          next[i] = is30 ? 'T1215' : 'T1230';
+          onChange('torusMix', next);
+        }
+      }, is30 ? '30°' : '15°'));
+    });
+    const presets = el('span', { style: 'display:inline-flex;gap:3px;margin-left:6px' },
+      el('button', { class: 'ghost', style: 'padding:2px 6px;font-size:10.5px', title: 'Whole hang T1215 (15°)',
+        onclick: () => onChange('torusMix', mix.map(() => 'T1215')) }, 'all 15°'),
+      el('button', { class: 'ghost', style: 'padding:2px 6px;font-size:10.5px', title: 'Whole hang T1230 (30°)',
+        onclick: () => onChange('torusMix', mix.map(() => 'T1230')) }, 'all 30°'));
+    chipRow.appendChild(presets);
+    wrap.appendChild(chipRow);
+    const n15 = mix.filter(m => m !== 'T1230').length;
+    const n30 = mix.length - n15;
+    wrap.appendChild(el('span', { style: 'font-size:10.5px;color:var(--text-muted)' },
+      `${n15}× T1215 + ${n30}× T1230 · box 1 = top of the hang`));
+    return wrap;
+  };
 
   // Box count
   const countInput = el('input', {
@@ -7922,6 +8092,7 @@ function renderArrayCard(arr, idx) {
     onchange: (e) => onChange('boxCount', Math.max(1, parseInt(e.target.value) || 1))
   });
   form.appendChild(field('Box count', countInput));
+  if (arr.boxType === 'T12') form.appendChild(field('Hang mix', buildTorusMixField()));
 
   // Resolution
   const resSelect = el('select', {
@@ -8012,7 +8183,12 @@ function renderArrayCard(arr, idx) {
     calc.ampPatch.forEach(p => {
       const boxLabel = p.boxes.length === 1 ? `box ${p.boxes[0]}` : `box ${p.boxes[0]}–${p.boxes[p.boxes.length-1]}`;
       const biampNote = p.biamp ? ' (LF/HF)' : '';
-      ul.appendChild(el('li', null, `${p.ampLabel} ${p.channelLabel}${biampNote} → ${boxLabel}`));
+      const li = el('li', null, `${p.ampLabel} ${p.channelLabel}${biampNote} → ${boxLabel}`);
+      if (p.torusSwitch) li.appendChild(el('span', {
+        style: 'font-size:10.5px;color:var(--text-muted);margin-left:6px',
+        title: 'TORUS rear NL4 switch position for this segment — two segments share one NL4d cable'
+      }, `NL4d#${p.torusNl4d} · switch ${p.torusSwitch}`));
+      ul.appendChild(li);
     });
     ampBlock.appendChild(ul);
   } else {
@@ -10752,10 +10928,12 @@ function renderSubDetailedDiagram(sa, calc) {
         bg.appendChild(binfo.glyph);
         svg.appendChild(bg);
         const _blkBot = nl8BlockY + binfo.height;
+        // 2026-07-05: label inside the block body (same fix as the main
+        // break-out block — below-labels collide when blocks sit adjacent).
         svg.appendChild(sv('text', {
-          x: blockX, y: _blkBot + 7,
-          'font-size': 6.5, fill: nl8Color, 'font-weight': 600, 'text-anchor': 'middle',
-          style: 'paint-order:stroke; stroke:var(--card-bg); stroke-width:2',
+          x: blockX, y: nl8BlockY + (compact ? 6.4 : 8),
+          'font-size': compact ? 5.4 : 6.4, fill: nl8Color, 'font-weight': 700, 'text-anchor': 'middle',
+          'pointer-events': 'none',
           'data-bundle': String(mpIdx), class: 'bundle-label-text'
         }, ibShort));
         // NL4 stubs from each socket → its sub.
@@ -10792,11 +10970,15 @@ function renderSubDetailedDiagram(sa, calc) {
       // translate-transform during X-drag for live feedback.
       const blockGroup = sv('g', { 'data-block': String(mpIdx) });
       blockGroup.appendChild(fanOut);
-      // Small "block" label below the glyph.
+      // 2026-07-05 (Martijn): label INSIDE the block body — the old label below
+      // the glyph overlapped its neighbours when several blocks sit side by side.
+      // Block body is var(--card-bg), so plain bundle-coloured text reads fine
+      // in both themes; sockets sit on the very bottom edge, clear of the text.
       const blockLabel = sv('text', {
-        x: fanOutX, y: _blockBotY + 9,
-        'font-size': 8.5, fill: _darkText(bundleColor), 'font-weight': 700, 'text-anchor': 'middle',
-        style: 'paint-order:stroke; stroke:var(--card-bg); stroke-width:2.5',
+        x: fanOutX, y: blockTopY + (compact ? 6.4 : 8),
+        'font-size': mpLbl.length > 6 ? (compact ? 4.6 : 5.4) : (compact ? 5.4 : 6.4),
+        fill: bundleColor, 'font-weight': 700, 'text-anchor': 'middle',
+        'pointer-events': 'none',
         'data-bundle': String(mpIdx)
       }, mpLbl);
       blockGroup.appendChild(blockLabel);
@@ -10805,7 +10987,7 @@ function renderSubDetailedDiagram(sa, calc) {
       const _bh = compact ? 12 : 15;
       const blockDrag = sv('rect', {
         x: fanOutX - _bw/2 - 4, y: blockTopY - 4,
-        width: _bw + 8, height: _bh + 18,
+        width: _bw + 8, height: _bh + 10,
         fill: 'transparent', 'pointer-events': 'all',
         'data-block': String(mpIdx)
       });
@@ -11451,7 +11633,13 @@ function computeRacksLayout(arr, calc, portsList, ampPositions) {
       for (let i = 0; i < cnt; i++) {
         panelKeyCounter[conn.panelKey]++;
         const assigned = [];
-        for (let j = 0; j < fan && cursor < rl.ampPortIndices.length; j++) {
+        // 2026-07-06 TORUS rear switch: one dual fan output (NL4d, 2 ch) feeds
+        // TWO groups/segments, so a torus trunk claims fan × 2 ports. Non-torus
+        // passive boxes have no switch → 1 group per fan output (unchanged);
+        // single-channel fan cables (NL4s/NL2) also stay 1:1.
+        const _fanCh = (CONNECTOR_TYPES[conn.fanCableType] || {}).channels || conn.fanCh || 1;
+        const _perOut = (DEFAULT_BOX_TYPES[arr.boxType]?.torus && _fanCh >= 2) ? 2 : 1;
+        for (let j = 0; j < fan * _perOut && cursor < rl.ampPortIndices.length; j++) {
           assigned.push(rl.ampPortIndices[cursor++]);
         }
         rl.trunks.push({
@@ -11766,7 +11954,7 @@ function renderDiagram(arr, calc) {
     svg.appendChild(sv('text', {
       x: boxLeftX + boxW / 2, y: bp.top + boxH / 2 + 4,
       'text-anchor': 'middle'
-    }, `${arr.boxType} #${bp.idx}`));
+    }, `${arr.boxType === 'T12' ? (((arr.torusMix || [])[bp.idx - 1] === 'T1230') ? 'T1230' : 'T1215') : arr.boxType} #${bp.idx}`));
 
     if (bp.posInGroup > 0) {
       const prev = boxPositions[i - 1];
@@ -12249,7 +12437,9 @@ function renderDetailedDiagram(arr, calc) {
           'text-anchor': 'middle', fill: 'var(--text-muted)',
           style: `font-size:${labelFont - 2}px`,
           class: 'svg-on-light-muted'
-        }, t.conn.mode === 'dual' ? 'dual fan' : (t.conn.mode === 'singleN2' ? 'single → NL2' : 'single → NL4s')));
+        }, (t.conn.mode === 'dual'
+              ? (DEFAULT_BOX_TYPES[arr.boxType]?.torus ? 'dual fan · 1 NL4d = 2 segments' : 'dual fan')
+              : (t.conn.mode === 'singleN2' ? 'single → NL2' : 'single → NL4s'))));
       } else {
         const cy = splitterTop + splitterH / 2;
         svg.appendChild(sv('rect', {
@@ -12266,9 +12456,16 @@ function renderDetailedDiagram(arr, calc) {
         }, `${fanLbl} #${t.idx}`));
       }
 
-      // Fanout NL4s (no length label — short patch leads after the breakout)
-      t.ports.forEach((pi, fanIdx) => {
-        const port = portsList[pi];
+      // Fanout leads (no length label — short patch leads after the breakout).
+      // 2026-07-06 TORUS: one dual fan output carries TWO groups (rear switch) —
+      // draw ONE lead to the first group's first box, then a dashed segment-link
+      // from that group's last box to the next group's first box.
+      const _torusPerOut = (DEFAULT_BOX_TYPES[arr.boxType]?.torus &&
+        (((CONNECTOR_TYPES[t.conn.fanCableType] || {}).channels || t.conn.fanCh || 1) >= 2)) ? 2 : 1;
+      const _outs = [];
+      for (let o = 0; o < t.ports.length; o += _torusPerOut) _outs.push(t.ports.slice(o, o + _torusPerOut));
+      _outs.forEach((outPorts, fanIdx) => {
+        const port = portsList[outPorts[0]];
         const firstBox = port.boxes[0];
         const bp = boxPositions[firstBox - 1];
         if (!bp) return;
@@ -12282,6 +12479,28 @@ function renderDetailedDiagram(arr, calc) {
           d: `M ${sx} ${fanY} C ${sx + dx*0.55} ${fanY}, ${sx + dx*0.45} ${ey}, ${ex} ${ey}`,
           fill: 'none', stroke: port.color, 'stroke-width': 1.8, opacity: 0.9
         }));
+        if (outPorts.length === 2) {
+          const p2 = portsList[outPorts[1]];
+          const bp1 = boxPositions[port.boxes[port.boxes.length - 1] - 1];   // last box of segment A
+          const bp2 = boxPositions[p2.boxes[0] - 1];                          // first box of segment B
+          if (bp1 && bp2) {
+            // 2026-07-06 follow-up (Martijn): the segment link is part of the same
+            // rear-panel daisy chain as the within-group jumpers — draw it on the
+            // SAME right-hand jumper rail (dashed to mark the switch boundary),
+            // with the cable length like every other link.
+            const jx = boxLeftX + boxW + jumperOffset;
+            svg.appendChild(sv('path', {
+              d: `M ${boxLeftX + boxW} ${bp1.center} L ${jx} ${bp1.center} L ${jx} ${bp2.center} L ${boxLeftX + boxW} ${bp2.center}`,
+              fill: 'none', stroke: port.color, 'stroke-width': 1.5,
+              'stroke-dasharray': '4 2.5', opacity: 0.9
+            }));
+            svg.appendChild(sv('text', {
+              x: jx + 6, y: (bp1.center + bp2.center) / 2 + 3,
+              fill: port.color,
+              style: `font-size:${labelFont - 3}px;font-weight:600`, opacity: '0.9'
+            }, `NL4 ${jumperLength}m link`));
+          }
+        }
       });
     });
 
@@ -12355,16 +12574,33 @@ function renderDetailedDiagram(arr, calc) {
   }
 
   // Boxes + jumpers
+  const _isTorusArr = !!DEFAULT_BOX_TYPES[arr.boxType]?.torus;
   boxPositions.forEach((bp, i) => {
     svg.appendChild(sv('rect', {
       class: 'box-rect',
       x: boxLeftX, y: bp.top, width: boxW, height: boxH, rx: 4
     }));
     svg.appendChild(sv('text', {
-      x: boxLeftX + boxW / 2, y: bp.top + boxH / 2 + 5,
-      'text-anchor': 'middle',
+      x: _isTorusArr ? boxLeftX + 8 : boxLeftX + boxW / 2, y: bp.top + boxH / 2 + 5,
+      'text-anchor': _isTorusArr ? 'start' : 'middle',
       style: `font-size:${labelFont}px`
-    }, `${arr.boxType} #${bp.idx}`));
+    }, `${arr.boxType === 'T12' ? (((arr.torusMix || [])[bp.idx - 1] === 'T1230') ? 'T1230' : 'T1215') : arr.boxType} #${bp.idx}`));
+    // 2026-07-06 TORUS: rear-switch position badge — which NL4 pin pair this
+    // box listens to. Even group = +1−1 (1st segment on the NL4d), odd = +2−2.
+    if (_isTorusArr) {
+      const _sw = (bp.groupIdx % 2 === 0) ? '+1−1' : '+2−2';
+      const _swCol = ((portsList.find(p => p.groupIdx === bp.groupIdx) || {}).color) || 'var(--text-muted)';
+      const _bgW = 34;
+      svg.appendChild(sv('rect', {
+        x: boxLeftX + boxW - _bgW - 5, y: bp.top + boxH / 2 - 7, width: _bgW, height: 14, rx: 4,
+        fill: _swCol, 'fill-opacity': '0.16', stroke: _swCol, 'stroke-width': 0.9
+      }));
+      svg.appendChild(sv('text', {
+        x: boxLeftX + boxW - 5 - _bgW / 2, y: bp.top + boxH / 2 + 3.5,
+        'text-anchor': 'middle', fill: _swCol,
+        style: `font-size:${labelFont - 3.5}px;font-weight:700`
+      }, `⇄ ${_sw}`));
+    }
 
     if (bp.posInGroup > 0) {
       const prev = boxPositions[i - 1];
@@ -12467,7 +12703,15 @@ function renderTotals() {
       });
     }
     if (boxCount > 0) {
-      boxMap.set(boxType, (boxMap.get(boxType) || 0) + boxCount);
+      // 2026-07-06: T12 mixed hangs roll up per real cabinet model in the totals.
+      if (boxType === 'T12' && Array.isArray(ref.torusMix) && ref.torusMix.length) {
+        const n30 = ref.torusMix.filter(mm => mm === 'T1230').length;
+        const n15 = ref.torusMix.length - n30;
+        if (n15) boxMap.set('T1215', (boxMap.get('T1215') || 0) + n15);
+        if (n30) boxMap.set('T1230', (boxMap.get('T1230') || 0) + n30);
+      } else {
+        boxMap.set(boxType, (boxMap.get(boxType) || 0) + boxCount);
+      }
     }
   });
 
@@ -12554,6 +12798,7 @@ function duplicateArray(idx) {
     rackDistances: { ...(orig.rackDistances || {}) }
   };
   if (orig.kind === 'fill') copy.fills = (orig.fills || []).map(fl => ({ ...fl }));
+  if (Array.isArray(orig.torusMix)) copy.torusMix = [...orig.torusMix];
   state.arrays.splice(idx + 1, 0, copy);
   saveState();
   renderAll();
@@ -12661,7 +12906,10 @@ function exportText() {
         });
       }
     } else {
-      lines.push(`${arr.boxCount}× ${DEFAULT_BOX_TYPES[arr.boxType]?.label || arr.boxType}, ${arr.resolution}-box res, ${MOUNTING_LABELS[arr.mounting] || arr.mounting}`);
+      const _mixTxt = (arr.boxType === 'T12' && Array.isArray(arr.torusMix) && arr.torusMix.length)
+        ? ` (${arr.torusMix.filter(mm => mm !== 'T1230').length}× T1215 + ${arr.torusMix.filter(mm => mm === 'T1230').length}× T1230, top→bottom: ${arr.torusMix.map(mm => mm === 'T1230' ? '30' : '15').join('/')})`
+        : '';
+      lines.push(`${arr.boxCount}× ${DEFAULT_BOX_TYPES[arr.boxType]?.label || arr.boxType}${_mixTxt}, ${arr.resolution}-box res, ${MOUNTING_LABELS[arr.mounting] || arr.mounting}`);
     }
     if (calc.racks && calc.racks.length) {
       const connLbl = formatRackOutputUsage(arr.rackConnectors) || '(no connectors picked)';
@@ -12686,7 +12934,8 @@ function exportText() {
         ? p.fillNames.join(' + ')
         : (p.boxes.length === 1 ? `box ${p.boxes[0]}` : `box ${p.boxes[0]}–${p.boxes[p.boxes.length-1]}`);
       const bi = p.biamp ? ' (LF/HF)' : '';
-      lines.push(`  ${p.ampLabel} ${p.channelLabel}${bi} → ${boxLabel}`);
+      const sw = p.torusSwitch ? ` [NL4d#${p.torusNl4d} switch ${p.torusSwitch}]` : '';
+      lines.push(`  ${p.ampLabel} ${p.channelLabel}${bi} → ${boxLabel}${sw}`);
     });
     lines.push('');
   });
@@ -13102,8 +13351,8 @@ const D3_BOX_TYPE_MAP = {
   WPC:     { kind: 'line', boxType: 'WPC' },
   WPS:     { kind: 'line', boxType: 'WPS' },
   WPM:     { kind: 'line', boxType: 'WPM' },
-  T1215:   { kind: 'line', boxType: 'T1215' },
-  T1230:   { kind: 'line', boxType: 'T1230' },
+  T1215:   { kind: 'line', boxType: 'T12', torusModel: 'T1215' },
+  T1230:   { kind: 'line', boxType: 'T12', torusModel: 'T1230' },
   SXH218:  { kind: 'sub', boxType: 'SXH218' },
   SXHF218: { kind: 'sub', boxType: 'SXHF218' },
   SX218:   { kind: 'sub', boxType: 'SX218' },
@@ -13121,6 +13370,7 @@ function mapD3Speaker(sp) {
     supported: !!hit,
     kind: hit ? hit.kind : null,
     boxType: hit ? hit.boxType : null,
+    torusModel: (hit && hit.torusModel) || null,
     count: sp.nCabs,
     mounting: grounded ? 'ground-stack' : 'flown-tour',
     name: (sp.name || sp.boxTypeId || 'D3 import').trim(),
@@ -13213,6 +13463,7 @@ function importD3Proposals() {
       const bt = DEFAULT_BOX_TYPES[p.boxType];
       if (bt && !bt.resolutions.includes(arr.resolution)) arr.resolution = bt.resolutions[0];
       if (bt && bt.defaultAmp) arr.ampType = bt.defaultAmp;
+      if (p.torusModel) arr.torusMix = Array(p.count).fill(p.torusModel);   // 2026-07-06: D3 T1215/T1230 → T12 mix
       arr.d3 = p.d3;
       state.arrays.push(arr);
     } else {
