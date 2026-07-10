@@ -3497,7 +3497,7 @@ const DEFAULT_BOX_TYPES = {
   // hang mixes 15° and 30° cabinets freely; the per-box mix lives in
   // `arr.torusMix` (array of 'T1215'|'T1230', top → bottom, length = boxCount).
   // T1215/T1230 stay defined (legacyHidden) so old saves migrate cleanly.
-  T12:   { label: 'TORUS T12 (15°/30° mix)', biamp: false, resolutions: [1, 2, 3, 4], torus: true, defaultAmp: 'iK42',
+  T12:   { label: 'TORUS T12', biamp: false, resolutions: [1, 2, 3, 4], torus: true, defaultAmp: 'iK42',
            limits: { 'flown-tour': 6, 'flown-install': 6, 'ground-stack': 3 }, stackedHardCap: false,
            jumperLengthM: 0.5,
            notes: 'Passive constant curvature, mixed 15°/30° cabinets per hang. Rear NL4 switch +1−1 / +2−2 → one NL4d feeds 2 array segments.' }
@@ -4680,8 +4680,9 @@ function computeProjectRackAllocation() {
     return matching ? matching.count * (AMP_TYPES[ampType]?.channels || 0) : 0;
   };
 
-  // Unified iteration: line arrays first (in order), then sub arrays (in order).
-  // Each item produces a totalCh and walks its rackIds the same way.
+  // Unified iteration in the SHARED card order (.ord — see _cardsMerged): the
+  // card you see higher on screen claims rack channels first. Falls back to
+  // arrays-then-subs when ord is missing (legacy states).
   const items = [
     ...(state.arrays || []).map(a => ({
       kind: a.kind === 'fill' ? 'fill' : 'line',
@@ -4704,6 +4705,7 @@ function computeProjectRackAllocation() {
       totalCh: subArrayTotalChannels(sa)
     }))
   ];
+  items.sort((a, b) => ((a.ref.ord ?? 1e9) - (b.ref.ord ?? 1e9)));
 
   items.forEach(item => {
     const arr = item.ref;
@@ -6138,6 +6140,21 @@ function calcSubArray(sa) {
     Object.keys(leavesByType).forEach(t => {
       leavesByType[t].forEach(lf => result.directTrunks.push(lf));
     });
+    // 2026-07-07 (Martijn): surplus warning for DIRECT NL4/NL2 picks too. The
+    // multipin allocator above deliberately skips nl4_* / nl2 variants (direct
+    // feeds are modelled via auto-fill), so over-picking those never got
+    // flagged — NL8 warned, NL4 didn't. Mirror the multipin surplus message.
+    ['nl4_dual', 'nl4_single', 'nl2'].forEach(k => {
+      const picked = userMix[k] || 0;
+      if (!picked) return;
+      const connD = CONNECTOR_TYPES[k] || {};
+      const need = (result.directTrunks || []).filter(t => (t.trunkType || 'nl4_dual') === k).length;
+      if (picked > need) {
+        result.warnings.push(
+          `${picked}× ${connD.shortLabel || k} picked but only ${need} usable — ${picked - need} unused (array doesn't need them)`
+        );
+      }
+    });
     // Warn if auto-fill happened.
     if (result.directTrunks.length > 0 && result.multipinTrunks.length > 0) {
       const byType = {};
@@ -7152,8 +7169,38 @@ function el(tag, attrs, ...children) {
   return e;
 }
 
+/* === Unified card order (2026-07-10, Martijn: fills onder subs kunnen zetten)
+   Line arrays, fill sets and sub arrays live in two collections but share ONE
+   display/allocation order via `.ord`. The ↑/↓ buttons move cards through the
+   MERGED list, so any card type can sit anywhere. `_renumberCards()` runs at
+   render time and heals missing ord values (legacy saves, imports) by
+   appending them in collection order — exactly the old behaviour. */
+function _cardsMerged() {
+  const list = [
+    ...(state.arrays || []).map(ref => ({ ref, col: 'arrays' })),
+    ...(state.subArrays || []).map(ref => ({ ref, col: 'subs' }))
+  ];
+  list.sort((a, b) => ((a.ref.ord ?? 1e9) - (b.ref.ord ?? 1e9)));   // stable: nieuwkomers achteraan
+  return list;
+}
+function _renumberCards() {
+  _cardsMerged().forEach((it, i) => { it.ref.ord = i; });
+}
+function _moveCardMerged(ref, dir) {
+  _renumberCards();
+  const list = _cardsMerged();
+  const i = list.findIndex(it => it.ref === ref);
+  const j = i + dir;
+  if (i < 0 || j < 0 || j >= list.length) return;
+  const other = list[j].ref;
+  const t = ref.ord; ref.ord = other.ord; other.ord = t;
+  saveState();
+  renderAll();
+}
+
 function renderAll() {
   // Pre-compute cross-array rack allocation once per render so calcArray can look it up.
+  _renumberCards();
   window._projectAllocation = computeProjectRackAllocation();
 
   const container = document.getElementById('arraysContainer');
@@ -7171,11 +7218,9 @@ function renderAll() {
     return;
   }
 
-  state.arrays.forEach((arr, idx) => {
-    container.appendChild(renderArrayCard(arr, idx));
-  });
-  state.subArrays.forEach((sa, idx) => {
-    container.appendChild(renderSubArrayCard(sa, idx));
+  _cardsMerged().forEach(it => {
+    if (it.col === 'arrays') container.appendChild(renderArrayCard(it.ref, state.arrays.indexOf(it.ref)));
+    else container.appendChild(renderSubArrayCard(it.ref, state.subArrays.indexOf(it.ref)));
   });
 
   renderTotals();
@@ -7621,6 +7666,8 @@ function renderFillSetCard(fs, idx) {
     style: 'font-size:10.5px;background:var(--raised);color:var(--text-muted);padding:2px 7px;border-radius:8px;font-weight:700;letter-spacing:0.4px'
   }, 'FILL SET'));
   header.appendChild(el('button', { class: 'ghost', title: 'Duplicate', onclick: () => duplicateArray(idx) }, '📑'));
+  header.appendChild(el('button', { class: 'ghost', title: 'Move up', onclick: () => moveArray(idx, -1) }, '↑'));
+  header.appendChild(el('button', { class: 'ghost', title: 'Move down', onclick: () => moveArray(idx, 1) }, '↓'));
   header.appendChild(el('button', { class: 'ghost', title: 'Delete', onclick: () => deleteArray(idx) }, '🗑'));
   card.appendChild(header);
   if (isCollapsed) {
@@ -7634,7 +7681,7 @@ function renderFillSetCard(fs, idx) {
   const fld = (labelTxt, input) => el('label', { style: 'display:flex;flex-direction:column;gap:3px;font-size:11.5px;color:var(--text-muted)' }, labelTxt, input);
   const boxSel = el('select', {
     onchange: (e) => onChange('boxType', e.target.value)
-  }, ...Object.keys(DEFAULT_BOX_TYPES).map(k => el('option', { value: k, selected: fs.boxType === k ? '' : null }, DEFAULT_BOX_TYPES[k].label || k)));
+  }, ...Object.keys(DEFAULT_BOX_TYPES).filter(k => !DEFAULT_BOX_TYPES[k].legacyHidden || k === fs.boxType).map(k => el('option', { value: k, selected: fs.boxType === k ? '' : null }, DEFAULT_BOX_TYPES[k].label || k)));
   form.appendChild(fld('Box type', boxSel));
   form.appendChild(fld('Fills', el('input', {
     type: 'number', min: '1', max: '32', step: '1', value: (fs.fills || []).length, style: 'width:60px',
@@ -7752,26 +7799,58 @@ function renderFillSetCard(fs, idx) {
   // --- per-fill table (channel is derived; dist/delay/gain editable) ---
   const _tdF = 'padding:2px 10px 2px 0;border-bottom:1px solid var(--border)';
   const tbl = el('table', { style: 'border-collapse:collapse;font-size:12.5px;margin:2px 0 6px' });
-  tbl.appendChild(el('tr', null, ...['Fill', 'Amp channel', 'Dist (m)', 'Delay (ms)', 'Gain (dB)'].map(h =>
+  // 2026-07-10 (Martijn): T12 fill sets show/edit the cabinet model per fill —
+  // a fill set has one boxType, so the 15°/30° distinction lives on the fill.
+  const _isT12Fills = fs.boxType === 'T12';
+  const _fillCols = _isT12Fills
+    ? ['', 'Fill', 'Model', 'Amp channel', 'Dist (m)', 'Delay (ms)', 'Gain (dB)']
+    : ['', 'Fill', 'Amp channel', 'Dist (m)', 'Delay (ms)', 'Gain (dB)'];
+  tbl.appendChild(el('tr', null, ..._fillCols.map(h =>
     el('th', { style: 'text-align:left;padding:2px 10px 2px 0;color:var(--text-muted);font-weight:600;border-bottom:1px solid var(--border-strong)' }, h))));
   const numIn = (val, step, ph, cb, w) => el('input', {
     type: 'number', step: String(step), value: (val == null || val === '') ? '' : val, placeholder: ph,
     style: `width:${w || 64}px;padding:1px 4px;font-size:12px;border:1px solid var(--border-strong);background:var(--input-bg);color:var(--text);border-radius:4px;text-align:right`,
     onchange: (e) => { const v = parseFloat(e.target.value); cb(isFinite(v) ? v : null); saveState(); renderAll(); }
   });
+  const _moveFill = (fi, dir) => {
+    const arr2 = fs.fills || [];
+    const j = fi + dir;
+    if (j < 0 || j >= arr2.length) return;
+    [arr2[fi], arr2[j]] = [arr2[j], arr2[fi]];
+    saveState(); renderAll();
+  };
   (fs.fills || []).forEach((fl, fi) => {
     const slot = calc.fillChannels[fi];
-    tbl.appendChild(el('tr', null,
+    const _mvBtn = (dir, sym, dis) => el('button', {
+      class: 'ghost', title: dir < 0 ? 'Move up' : 'Move down',
+      style: 'padding:0 4px;font-size:11px;line-height:1.2;border:none;background:transparent;' +
+             (dis ? 'opacity:0.25;cursor:default' : 'cursor:pointer'),
+      onclick: () => { if (!dis) _moveFill(fi, dir); }
+    }, sym);
+    const _rowCells = [
+      el('td', { style: _tdF + ';white-space:nowrap', class: 'rack-chip-hide-print' },
+        _mvBtn(-1, '▲', fi === 0), _mvBtn(1, '▼', fi === (fs.fills || []).length - 1)),
       el('td', { style: _tdF }, el('input', {
         type: 'text', value: fl.name || `Fill ${fi + 1}`,
         style: 'width:72px;padding:1px 4px;font-size:12px;border:1px solid var(--border-strong);background:var(--input-bg);color:var(--text);border-radius:4px',
         onchange: (e) => { fl.name = e.target.value; saveState(); renderAll(); }
-      })),
+      }))
+    ];
+    if (_isT12Fills) {
+      _rowCells.push(el('td', { style: _tdF }, el('select', {
+        style: 'padding:1px 3px;font-size:12px;border:1px solid var(--border-strong);background:var(--input-bg);color:var(--text);border-radius:4px',
+        title: 'Cabinet model of this fill (15° or 30° vertical coverage)',
+        onchange: (e) => { fl.model = e.target.value; saveState(); renderAll(); }
+      }, el('option', { value: 'T1215', selected: (fl.model || 'T1215') !== 'T1230' ? '' : null }, 'T1215 (15°)'),
+         el('option', { value: 'T1230', selected: fl.model === 'T1230' ? '' : null }, 'T1230 (30°)'))));
+    }
+    _rowCells.push(
       el('td', { style: _tdF }, slot ? `${slot.rackName ? slot.rackName + ' ' : ''}${slot.ampLabel} ${slot.channelLabel}` : '—'),
       el('td', { style: _tdF }, numIn(fl.distM, 0.5, `${fs.ampDistanceM || 15}`, v => fl.distM = v)),
       el('td', { style: _tdF }, numIn(fl.delayMs, 0.01, '0', v => fl.delayMs = v || 0)),
       el('td', { style: _tdF }, numIn(fl.gainDb, 0.1, '0', v => fl.gainDb = v || 0))
-    ));
+    );
+    tbl.appendChild(el('tr', null, ..._rowCells));
   });
   card.appendChild(tbl);
   if (fs.d3) card.appendChild(el('p', { style: 'font-size:11px;color:var(--text-muted);margin:0 0 6px' },
@@ -10025,7 +10104,30 @@ function renderSubDetailedDiagram(sa, calc) {
   const svgDefs = sv('defs', {});
   svg.appendChild(svgDefs);
   // gradId helper for per-channel cables.
-  const cableGradId = (laneIdx) => `cableGrad_${laneIdx}`;
+  // 2026-07-10 (Martijn: modal shows no cables, print does): gradient IDs must
+  // be UNIQUE PER RENDER INSTANCE. The sub-array card holds a hidden
+  // (display:none) print-only copy of this SVG; with shared IDs the browser
+  // resolves url(#cableGrad_0) document-wide to that hidden copy's gradient,
+  // and a paint server inside a display:none subtree doesn't render → the
+  // MODAL's cables went invisible (print showed them because there the hidden
+  // wrapper becomes visible). A per-render sequence number ends the collision.
+  const _gradSeq = (renderSubDetailedDiagram._gradSeq = (renderSubDetailedDiagram._gradSeq || 0) + 1);
+  const cableGradId = (laneIdx) => `cableGrad_${_gradSeq}_${laneIdx}`;
+  // 2026-07-07 (Martijn: NL4d cardioid cables invisible in the browser): the
+  // gradients were on the default objectBoundingBox units — browsers drop
+  // gradient strokes when a path's bounding box degenerates (and are generally
+  // pickier than resvg here). At draw time we know the cable's real X extent,
+  // so pin the gradient to userSpaceOnUse across exactly that span — visually
+  // identical 50/50 split, but render-proof.
+  const _fixCableGrad = (laneIdx, xA, xB) => {
+    const g = svgDefs.querySelector('#' + cableGradId(laneIdx));
+    if (!g) return;
+    g.setAttribute('gradientUnits', 'userSpaceOnUse');
+    g.setAttribute('x1', String(Math.min(xA, xB)));
+    g.setAttribute('x2', String(Math.max(xA, xB)));
+    g.setAttribute('y1', '0');
+    g.setAttribute('y2', '0');
+  };
   pairData.forEach(pd => {
     if (!pd.perCh) return;
     const g = sv('linearGradient', {
@@ -10425,6 +10527,7 @@ function renderSubDetailedDiagram(sa, calc) {
       const buildDV = (lx) => `M ${sX} ${sY} L ${lx} ${sY} L ${lx} ${eY} L ${eX} ${eY}`;
       const hitV = sv('path', { d: buildDV(laneXLive), fill: 'none', stroke: 'transparent', 'stroke-width': 10, 'pointer-events': 'stroke', 'data-pair': String(pd.laneIdx) });
       svg.appendChild(hitV);
+      if (pd.perCh) _fixCableGrad(pd.laneIdx, sX, eX);
       const strokeV = pd.perCh ? `url(#${cableGradId(pd.laneIdx)})` : pd.color;
       const visV = sv('path', { d: buildDV(laneXLive), fill: 'none', stroke: strokeV, 'stroke-width': compact ? 1.6 : 2, 'stroke-linejoin': 'round', 'pointer-events': 'none', 'data-pair': String(pd.laneIdx) });
       svg.appendChild(visV);
@@ -10460,6 +10563,7 @@ function renderSubDetailedDiagram(sa, calc) {
     svg.appendChild(hitPath);
     // 2026-06-03: per-channel cardioid pairs use a two-tone gradient (F → B)
     // across the cable bounding box. Non-cardioid pairs use the single pair color.
+    if (pd.perCh) _fixCableGrad(pd.laneIdx, startX, endX);
     const cableStroke = pd.perCh ? `url(#${cableGradId(pd.laneIdx)})` : pd.color;
     const visPath = sv('path', {
       d: buildD(dropXLive, routeYLive),
@@ -12733,7 +12837,13 @@ function renderTotals() {
     }
     if (boxCount > 0) {
       // 2026-07-06: T12 mixed hangs roll up per real cabinet model in the totals.
-      if (boxType === 'T12' && Array.isArray(ref.torusMix) && ref.torusMix.length) {
+      if (boxType === 'T12' && ref.kind === 'fill' && Array.isArray(ref.fills)) {
+        // 2026-07-10: T12 fill sets roll up per fill model too (default T1215).
+        const n30f = ref.fills.filter(fl => fl.model === 'T1230').length;
+        const n15f = ref.fills.length - n30f;
+        if (n15f) boxMap.set('T1215', (boxMap.get('T1215') || 0) + n15f);
+        if (n30f) boxMap.set('T1230', (boxMap.get('T1230') || 0) + n30f);
+      } else if (boxType === 'T12' && Array.isArray(ref.torusMix) && ref.torusMix.length) {
         const n30 = ref.torusMix.filter(mm => mm === 'T1230').length;
         const n15 = ref.torusMix.length - n30;
         if (n15) boxMap.set('T1215', (boxMap.get('T1215') || 0) + n15);
@@ -12828,6 +12938,7 @@ function duplicateArray(idx) {
   };
   if (orig.kind === 'fill') copy.fills = (orig.fills || []).map(fl => ({ ...fl }));
   if (Array.isArray(orig.torusMix)) copy.torusMix = [...orig.torusMix];
+  copy.ord = (typeof orig.ord === 'number' ? orig.ord : 0) + 0.5;   // direct na origineel; renumber egaliseert
   state.arrays.splice(idx + 1, 0, copy);
   saveState();
   renderAll();
@@ -12842,12 +12953,8 @@ function deleteArray(idx) {
 }
 
 function moveArray(idx, dir) {
-  const newIdx = idx + dir;
-  if (newIdx < 0 || newIdx >= state.arrays.length) return;
-  const [item] = state.arrays.splice(idx, 1);
-  state.arrays.splice(newIdx, 0, item);
-  saveState();
-  renderAll();
+  // 2026-07-10: moves through the MERGED card order (arrays + subs).
+  if (state.arrays[idx]) _moveCardMerged(state.arrays[idx], dir);
 }
 
 /* ----------------------------- SUB ARRAY ACTIONS ----------------------------- */
@@ -12894,6 +13001,7 @@ function duplicateSubArray(idx) {
     rackArrivals: { ...(orig.rackArrivals || {}) },
     multipinPatchBlock: { ...(orig.multipinPatchBlock || {}) }
   };
+  copy.ord = (typeof orig.ord === 'number' ? orig.ord : 0) + 0.5;   // direct na origineel in de merged volgorde
   state.subArrays.splice(idx + 1, 0, copy);
   saveState();
   renderAll();
@@ -12908,12 +13016,8 @@ function deleteSubArray(idx) {
 }
 
 function moveSubArray(idx, dir) {
-  const newIdx = idx + dir;
-  if (newIdx < 0 || newIdx >= state.subArrays.length) return;
-  const [item] = state.subArrays.splice(idx, 1);
-  state.subArrays.splice(newIdx, 0, item);
-  saveState();
-  renderAll();
+  // 2026-07-10: moves through the MERGED card order (arrays + subs).
+  if (state.subArrays[idx]) _moveCardMerged(state.subArrays[idx], dir);
 }
 
 function exportText() {
@@ -12925,7 +13029,10 @@ function exportText() {
     const calc = calcArray(arr);
     lines.push(`=== ${arr.name} ===`);
     if (arr.kind === 'fill') {
-      lines.push(`${(arr.fills || []).length}× ${DEFAULT_BOX_TYPES[arr.boxType]?.label || arr.boxType} fills, ${+arr.fillsPerChannel === 2 ? '2 fills/channel (parallel)' : '1 fill/channel'}`);
+      const _fMdl = (arr.boxType === 'T12')
+        ? ' (' + ['T1215', 'T1230'].map(m => { const n = (arr.fills || []).filter(fl => (fl.model || 'T1215') === m).length; return n ? `${n}× ${m}` : null; }).filter(Boolean).join(' + ') + ')'
+        : '';
+      lines.push(`${(arr.fills || []).length}× ${DEFAULT_BOX_TYPES[arr.boxType]?.label || arr.boxType} fills${_fMdl}, ${+arr.fillsPerChannel === 2 ? '2 fills/channel (parallel)' : '1 fill/channel'}`);
       const dsp = (arr.fills || []).filter(fl => Math.abs(+fl.delayMs || 0) > 0.005 || Math.abs(+fl.gainDb || 0) > 0.005);
       if (dsp.length) {
         lines.push('DSP per fill:');
@@ -13325,11 +13432,19 @@ function parseD3Speakers(text) {
       pos: pos ? { x: +pos[1], y: +pos[2], z: +pos[3] } : null
     };
     if (!isSub) {
+      // 2026-07-10 (Werfpop): CLUSTER speakers (e.g. single-cab TORUS T12
+      // frontfills) have cabinets WITHOUT tiltAngle — fall back to counting
+      // devices.Cabinet class refs (one per cabinet, verified against Demo 4:
+      // 78 refs = 78 cabs). The T12 model (15°/30°) hides in limitId
+      // ('1_15_V'), and the speaker-level libraryId says 'Torus T12'.
       return Object.assign(base, {
         kind: 'lineHang',
         boxTypeId: g(/^ {6}boxTypeId: (.+)$/m),
+        libraryId: g(/^ {4}libraryId: (.+)$/m),
+        limitId: g(/^ {4}limitId: (.+)$/m),
         frame: g(/^ {6}libraryId: ([A-Z0-9_]*FRAME[A-Z0-9_]*)$/m),
-        nCabs: (ch.match(/^ {8}tiltAngle:/mg) || []).length
+        nCabs: (ch.match(/^ {8}tiltAngle:/mg) || []).length ||
+               (ch.match(/devices\.Cabinet\b/g) || []).length
       });
     }
     // === SUB_ARRAY hang (2026-07-04) ===
@@ -13382,6 +13497,8 @@ const D3_BOX_TYPE_MAP = {
   WPM:     { kind: 'line', boxType: 'WPM' },
   T1215:   { kind: 'line', boxType: 'T12', torusModel: 'T1215' },
   T1230:   { kind: 'line', boxType: 'T12', torusModel: 'T1230' },
+  T12:     { kind: 'line', boxType: 'T12' },
+  TORUS:   { kind: 'line', boxType: 'T12' },
   SXH218:  { kind: 'sub', boxType: 'SXH218' },
   SXHF218: { kind: 'sub', boxType: 'SXHF218' },
   SX218:   { kind: 'sub', boxType: 'SX218' },
@@ -13393,13 +13510,20 @@ const D3_BOX_TYPE_MAP = {
 };
 
 function mapD3Speaker(sp) {
-  const hit = D3_BOX_TYPE_MAP[(sp.boxTypeId || '').toUpperCase()];
+  // 2026-07-10: TORUS clusters say boxTypeId 'Torus' / libraryId 'Torus T12' —
+  // normalise to the T12 key; the 15°/30° model comes from limitId ('1_15_V').
+  let _key = (sp.boxTypeId || '').toUpperCase();
+  if (sp.kind === 'lineHang' && (/^TORUS/.test(_key) || /T12/i.test(sp.libraryId || ''))) _key = 'T12';
+  const hit = D3_BOX_TYPE_MAP[_key];
   const grounded = /ground|stack/i.test(sp.deploymentId || '');
   const out = {
     supported: !!hit,
     kind: hit ? hit.kind : null,
     boxType: hit ? hit.boxType : null,
-    torusModel: (hit && hit.torusModel) || null,
+    torusModel: (hit && hit.torusModel) ||
+      ((hit && hit.boxType === 'T12')
+        ? (/30/.test(sp.limitId || '') ? 'T1230' : 'T1215')
+        : null),
     count: sp.nCabs,
     mounting: grounded ? 'ground-stack' : 'flown-tour',
     name: (sp.name || sp.boxTypeId || 'D3 import').trim(),
@@ -13450,7 +13574,10 @@ function openD3ImportModal() {
     row.appendChild(el('span', { style: 'font-weight:600;min-width:120px' }, p.name));
     let desc;
     if (p.kind === 'fillset') {
-      desc = `${p.boxType} ×${p.count} — fill set (${p.fills.map(fl => fl.name).join(', ')}), one tail per fill`;
+      const _mdl = p.fills.some(fl => fl.model)
+        ? ' · ' + ['T1215', 'T1230'].map(m => { const n = p.fills.filter(fl => (fl.model || 'T1215') === m).length; return n ? `${n}× ${m}` : null; }).filter(Boolean).join(' + ')
+        : '';
+      desc = `${p.boxType} ×${p.count} — fill set (${p.fills.map(fl => fl.name).join(', ')}), one tail per fill${_mdl}`;
     } else if (!p.supported) {
       desc = `${p.d3.boxTypeId} ×${p.count} — ${p.note}`;
     } else if (p.kind === 'sub') {
@@ -13483,7 +13610,7 @@ function importD3Proposals() {
       const fsn = defaultFillSet();
       fsn.name = p.name;
       fsn.boxType = p.boxType;
-      fsn.fills = p.fills.map(fl => ({ name: fl.name, distM: null, delayMs: fl.delayMs || 0, gainDb: fl.gainDb || 0, pos: fl.pos || null }));
+      fsn.fills = p.fills.map(fl => ({ name: fl.name, distM: null, delayMs: fl.delayMs || 0, gainDb: fl.gainDb || 0, pos: fl.pos || null, model: fl.model || null }));
       fsn.d3 = p.d3;
       state.arrays.push(fsn);
     } else if (p.kind === 'line') {
@@ -13568,7 +13695,7 @@ function buildD3Proposals(speakers) {
         supported: true, kind: 'fillset', boxType,
         count: grp.length,
         name: prefix ? `${prefix} fills` : `${boxType} fills`,
-        fills: grp.map(p => ({ name: p.name, pos: p.d3.pos, delayMs: p.d3.inputDelay || 0, gainDb: p.d3.inputGain || 0 })),
+        fills: grp.map(p => ({ name: p.name, pos: p.d3.pos, delayMs: p.d3.inputDelay || 0, gainDb: p.d3.inputGain || 0, model: p.torusModel || null })),
         d3: { grouped: grp.map(p => p.name) },
         note: null
       };
