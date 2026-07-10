@@ -3810,6 +3810,42 @@ const CASTELLATED_PRESET_LABELS = {
 // SX215 en de SXC118/SXCF118 (cardioid intern) zijn uitgesloten.
 const CASTELLATED_ALLOWED_BOXES = ['SXH218', 'SXHF218', 'SX218', 'SX218+', 'SX118+'];
 
+// 2026-07-10 (Martijn): splay-PIN sets per Wave box type — the labels a rigger
+// actually dials. DISPLAY 3 exports the RESULTING angles, which sit a roughly
+// constant ~0.3–0.4° BELOW the pin label (acoustic-centre correction), so
+// nearest-pin on the raw value picks the wrong pin. `snapSplayToPins` fits the
+// constant offset per array (scan c, minimise total distance to the pin set)
+// and only snaps when the fit is tight — custom angles fall back to raw.
+const SPLAY_PIN_SETS = {
+  WPL: [0.5, 1, 2, 3, 4, 5, 6, 7.5],
+  WPC: [0.5, 1, 2, 4, 6.5, 10],
+  WPS: [0.5, 1, 2, 4, 6.5, 10],
+  WPM: [0.5, 2, 4, 6.5, 10]
+};
+function snapSplayToPins(angles, boxType) {
+  const pins = SPLAY_PIN_SETS[boxType];
+  if (!pins || !Array.isArray(angles) || angles.length < 2) return null;
+  const vals = angles.slice(1).filter(a => isFinite(a));
+  if (!vals.length) return null;
+  let bestC = 0, bestCost = Infinity;
+  for (let c = 0; c <= 0.61; c += 0.01) {
+    let cost = 0;
+    for (const a of vals) {
+      let m = Infinity;
+      for (const p of pins) m = Math.min(m, Math.abs(a + c - p));
+      cost += m;
+    }
+    if (cost < bestCost) { bestCost = cost; bestC = c; }
+  }
+  if (bestCost / vals.length > 0.15) return null;   // fit te slecht → custom hoeken
+  return angles.map((a, i) => {
+    if (i === 0 || !isFinite(a)) return null;       // box 1 = aim
+    let pick = pins[0];
+    for (const p of pins) if (Math.abs(a + bestC - p) < Math.abs(a + bestC - pick)) pick = p;
+    return pick;
+  });
+}
+
 const AMP_TYPES = {
   iK41: { label: 'iK41', channels: 4, notes: '4ch, 1500W/2Ω' },
   iK42: { label: 'iK42', channels: 4, notes: '4ch, 5000W/2Ω' },
@@ -8326,8 +8362,54 @@ function renderArrayCard(arr, idx) {
   printWrap.appendChild(renderDetailedDiagram(arr, calc));
   diagBlock.appendChild(printWrap);
 
+  // === 2026-07-10: Rigging block (D2-report parity, data from the D3 import) —
+  // design aim / trim height / air temp + per-box splay table. Only when this
+  // array was imported from a .d3 that carried the data. Prints with the card.
+  let riggingBlock = null;
+  const _rd3 = arr.d3 || null;
+  if (_rd3 && (Array.isArray(_rd3.splay) || isFinite(_rd3.tilt))) {
+    riggingBlock = el('div', { class: 'result-block' });
+    riggingBlock.appendChild(el('h3', null, '📐 Rigging (DISPLAY 3)'));
+    const facts = el('div', { style: 'font-size:12.5px;margin-bottom:6px;display:flex;flex-wrap:wrap;gap:4px 18px' });
+    if (isFinite(_rd3.tilt)) facts.appendChild(el('span', null, `Design aim: `, el('b', null, `${(+_rd3.tilt).toFixed(1)}°`)));
+    if (_rd3.pos && isFinite(_rd3.pos.z)) facts.appendChild(el('span', null, `Trim height: `, el('b', null, `${(+_rd3.pos.z).toFixed(2)} m`)));
+    if (isFinite(_rd3.turn) && Math.abs(_rd3.turn) > 0.01) facts.appendChild(el('span', null, `Turn: `, el('b', null, `${(+_rd3.turn).toFixed(1)}°`)));
+    if (_rd3.envTempC != null) facts.appendChild(el('span', null, `Air temp: `, el('b', null, `${_rd3.envTempC} °C`)));
+    riggingBlock.appendChild(facts);
+    if (Array.isArray(_rd3.splay) && _rd3.splay.length > 1) {
+      // 2026-07-10: show the PIN LABELS the rigger dials (offset-fitted per
+      // array against SPLAY_PIN_SETS); the raw D3 angle sits in the tooltip.
+      const _pins = snapSplayToPins(_rd3.splay, arr.boxType);
+      const _tdR = 'padding:1px 12px 1px 0;border-bottom:1px solid var(--border)';
+      const rtbl = el('table', { style: 'border-collapse:collapse;font-size:12px' });
+      rtbl.appendChild(el('tr', null, ...['Box', 'Model', 'Splay'].map(h =>
+        el('th', { style: 'text-align:left;padding:1px 12px 1px 0;color:var(--text-muted);font-weight:600;border-bottom:1px solid var(--border-strong)' }, h))));
+      _rd3.splay.forEach((ang, bi) => {
+        const mdl = arr.boxType === 'T12'
+          ? (((arr.torusMix || [])[bi] === 'T1230') ? 'T1230' : 'T1215')
+          : arr.boxType;
+        const cellTxt = bi === 0 ? 'aim'
+          : (_pins && _pins[bi] != null) ? `${_pins[bi]}°` : `${(+ang).toFixed(2)}°`;
+        rtbl.appendChild(el('tr', null,
+          el('td', { style: _tdR }, String(bi + 1)),
+          el('td', { style: _tdR }, mdl),
+          el('td', {
+            style: _tdR + ';text-align:right;font-variant-numeric:tabular-nums',
+            title: bi === 0 ? 'Top box — carries the site angle' : `D3 resulting angle: ${(+ang).toFixed(2)}°`
+          }, cellTxt)
+        ));
+      });
+      riggingBlock.appendChild(rtbl);
+      riggingBlock.appendChild(el('p', { style: 'font-size:11px;color:var(--text-muted);margin:6px 0 0' },
+        _pins
+          ? 'Splay shown as PIN labels (fitted from the D3 angles — hover a value for the exact resulting angle). Box 1 = top, carries the site angle.'
+          : 'Inter-cabinet angles as DISPLAY 3 reports them (no matching pin set — custom angles or unknown box type). Box 1 = top, carries the site angle.'));
+    }
+  }
+
   resultGrid.appendChild(cableBlock);
   resultGrid.appendChild(ampBlock);
+  if (riggingBlock) resultGrid.appendChild(riggingBlock);
   resultGrid.appendChild(diagBlock);
   card.appendChild(resultGrid);
 
@@ -13046,6 +13128,18 @@ function exportText() {
         ? ` (${arr.torusMix.filter(mm => mm !== 'T1230').length}× T1215 + ${arr.torusMix.filter(mm => mm === 'T1230').length}× T1230, top→bottom: ${arr.torusMix.map(mm => mm === 'T1230' ? '30' : '15').join('/')})`
         : '';
       lines.push(`${arr.boxCount}× ${DEFAULT_BOX_TYPES[arr.boxType]?.label || arr.boxType}${_mixTxt}, ${arr.resolution}-box res, ${MOUNTING_LABELS[arr.mounting] || arr.mounting}`);
+      if (arr.d3 && (isFinite(arr.d3.tilt) || Array.isArray(arr.d3.splay))) {
+        const bits = [];
+        if (isFinite(arr.d3.tilt)) bits.push(`design aim ${(+arr.d3.tilt).toFixed(1)}°`);
+        if (arr.d3.pos && isFinite(arr.d3.pos.z)) bits.push(`trim ${(+arr.d3.pos.z).toFixed(2)}m`);
+        if (Array.isArray(arr.d3.splay) && arr.d3.splay.length > 1) {
+          const _p = snapSplayToPins(arr.d3.splay, arr.boxType);
+          bits.push(_p
+            ? `splay pins top→bottom: aim/${_p.slice(1).map(p => p).join('/')}°`
+            : `splay top→bottom: aim/${arr.d3.splay.slice(1).map(a => (+a).toFixed(2)).join('/')}°`);
+        }
+        lines.push('Rigging (D3): ' + bits.join(' · '));
+      }
     }
     if (calc.racks && calc.racks.length) {
       const connLbl = formatRackOutputUsage(arr.rackConnectors) || '(no connectors picked)';
@@ -13403,6 +13497,8 @@ async function _d3ReadZipEntry(buf, wantName) {
    connectible fields (boxTypeId / frame libraryId) indent 6, cabinet fields
    indent 8 (one tiltAngle per cabinet → cabinet count). */
 function parseD3Speakers(text) {
+  // 2026-07-10 (D2-report parity): venue air temperature — one value per project.
+  const _envT = parseFloat((text.match(/^\s*airTemperature: ([^\n]+)$/m) || [])[1]);
   const ssIdx = text.search(/^soundsystem:/m);
   if (ssIdx < 0) throw new Error('no soundsystem section in project');
   let sec = text.slice(ssIdx);
@@ -13443,6 +13539,11 @@ function parseD3Speakers(text) {
         libraryId: g(/^ {4}libraryId: (.+)$/m),
         limitId: g(/^ {4}limitId: (.+)$/m),
         frame: g(/^ {6}libraryId: ([A-Z0-9_]*FRAME[A-Z0-9_]*)$/m),
+        // 2026-07-10: per-cabinet splay (D3 tiltAngle = ACTUAL inter-cabinet
+        // angle, top→bottom; box 1 = 0 = the aim reference). NB: these are the
+        // resulting angles, not the D2 pin labels (0.21° ≈ pin 0.5° on WPL).
+        splay: [...ch.matchAll(/^ {8}tiltAngle: ([^\n]+)$/mg)].map(m => parseFloat(m[1])),
+        envTempC: isFinite(_envT) ? _envT : null,
         nCabs: (ch.match(/^ {8}tiltAngle:/mg) || []).length ||
                (ch.match(/devices\.Cabinet\b/g) || []).length
       });
@@ -13527,7 +13628,9 @@ function mapD3Speaker(sp) {
     count: sp.nCabs,
     mounting: grounded ? 'ground-stack' : 'flown-tour',
     name: (sp.name || sp.boxTypeId || 'D3 import').trim(),
-    d3: { boxTypeId: sp.boxTypeId, frame: sp.frame || null, pos: sp.pos, tilt: sp.tilt, turn: sp.turn, deploymentId: sp.deploymentId, inputGain: sp.inputGain || 0, inputDelay: sp.inputDelay || 0 },
+    d3: { boxTypeId: sp.boxTypeId, frame: sp.frame || null, pos: sp.pos, tilt: sp.tilt, turn: sp.turn, deploymentId: sp.deploymentId, inputGain: sp.inputGain || 0, inputDelay: sp.inputDelay || 0,
+          splay: (sp.splay && sp.splay.length > 1) ? sp.splay : null,
+          envTempC: sp.envTempC != null ? sp.envTempC : null },
     note: hit ? null : ('box type "' + sp.boxTypeId + '" not supported by this tool')
   };
   if (sp.kind !== 'subArray') return out;
