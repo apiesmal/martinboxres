@@ -4356,9 +4356,14 @@ function closeQrModal(){ document.getElementById('qrModal').classList.add('hidde
 // on its own page after the diagram. Scan it on-site to open the interactive viewer.
 function makeViewerQrPage(sa){
   if (!sa || typeof qrcode === 'undefined') return null;
-  let dataUrl;
-  try { const qr = qrcode(0, 'M'); qr.addData(buildViewerLink(sa)); qr.make(); dataUrl = qr.createDataURL(8, 2); }
-  catch(e){ return null; }
+  // 2026-07-07 (Martijn: print QR came out as an empty box): the QR is now an
+  // INLINE SVG instead of a GIF data-URL <img> — browsers occasionally drop
+  // large data-URL images from print rasterization, vector paths never.
+  let svgTag;
+  try {
+    const qr = qrcode(0, 'M'); qr.addData(buildViewerLink(sa)); qr.make();
+    svgTag = qr.createSvgTag({ cellSize: 4, margin: 16, scalable: true });
+  } catch(e){ return null; }
   let calc = {}; try { calc = calcSubArray(sa) || {}; } catch(e){}
   const g = calc.geometry || {};
   const cabs = (calc.subList || []).length;
@@ -4379,7 +4384,16 @@ function makeViewerQrPage(sa){
   if (racks.length) add('Racks', racks.join(', '));
   const page = el('div', { class: 'print-qr-page' });
   const left = el('div', { class: 'pq-left' });
-  left.appendChild(el('img', { src: dataUrl, alt: 'QR', class: 'pq-img' }));
+  const qrHolder = el('div', { class: 'pq-img' });
+  qrHolder.innerHTML = svgTag;
+  const _qrSvg = qrHolder.querySelector('svg');
+  if (_qrSvg) {
+    _qrSvg.setAttribute('width', '100%');
+    _qrSvg.setAttribute('height', '100%');
+    _qrSvg.setAttribute('shape-rendering', 'crispEdges');
+    _qrSvg.style.display = 'block';
+  }
+  left.appendChild(qrHolder);
   left.appendChild(el('div', { class: 'pq-cap' }, 'Scan to open the interactive diagram on your phone'));
   page.appendChild(left);
   const info = el('div', { class: 'pq-info' });
@@ -4521,6 +4535,8 @@ function loadState() {
           a.boxType = 'T12';
         }
         if (!Array.isArray(a.torusMix)) a.torusMix = [];
+        // 2026-07-06: hard cap — torus hangs never exceed 6 boxes.
+        if (DEFAULT_BOX_TYPES[a.boxType]?.torus && (+a.boxCount || 1) > 6) a.boxCount = 6;
         if (a.boxType === 'T12') {
           const n = Math.max(1, +a.boxCount || 1);
           while (a.torusMix.length < n) a.torusMix.push(a.torusMix[a.torusMix.length - 1] || 'T1215');
@@ -5521,7 +5537,11 @@ function calcSubArray(sa) {
     // Stack-group width: in portrait multi-layer, each stack-group occupies layers × subW
     // (cabs side-by-side, assumed flush). In landscape or portrait F, group = single cab.
     const groupW = (isPortrait && layersPerStack > 1) ? layersPerStack * subW : subW;
-    const aW = +sa.arrayWidthM || 0;
+    const aWraw = +sa.arrayWidthM || 0;
+    // 2026-07-06 (Martijn): the gap can never go NEGATIVE — cabs can't overlap.
+    // Width floors at the physical minimum (all stack-groups flush, gap = 0).
+    const minW = stackCount * groupW;
+    const aW = aWraw > 0 ? Math.max(aWraw, minW) : 0;
     if (aW > 0) {
       // centers = stack-group center to stack-group center distance.
       // arrayWidth interpreted as outermost cab edge to outermost cab edge.
@@ -5532,10 +5552,10 @@ function calcSubArray(sa) {
         subHeightM: subH,
         groupWidthM: groupW,
         centers,
-        gap: centers - groupW
+        gap: Math.max(0, centers - groupW)
       };
-      if (centers < groupW) {
-        result.warnings.push(`Array width ${aW.toFixed(2)} m is tight — gap between stack-groups would be negative (${(centers - groupW).toFixed(2)} m). Increase array width or reduce stack count.`);
+      if (aWraw > 0 && aWraw < minW) {
+        result.warnings.push(`Array width ${aWraw.toFixed(2)} m is below the physical minimum (${stackCount}× ${groupW.toFixed(2)} m cabs) — using ${minW.toFixed(2)} m with the stacks flush (gap 0).`);
       }
     } else {
       const why = effectivePairing === 'mirroredPerLayer' ? 'mirror jumper'
@@ -7796,6 +7816,8 @@ function renderArrayCard(arr, idx) {
       // Reset amp to default for this type
       arr.ampType = DEFAULT_BOX_TYPES[val]?.defaultAmp || arr.ampType;
     }
+    // 2026-07-06: TORUS hard cap — switching to a torus type clamps the count.
+    if (key === 'boxType' && DEFAULT_BOX_TYPES[val]?.torus && arr.boxCount > 6) arr.boxCount = 6;
     // 2026-07-06: T12 mix follows boxCount / boxType changes.
     if (arr.boxType === 'T12' && (key === 'boxCount' || key === 'boxType')) {
       if (!Array.isArray(arr.torusMix)) arr.torusMix = [];
@@ -8086,10 +8108,17 @@ function renderArrayCard(arr, idx) {
     return wrap;
   };
 
-  // Box count
+  // Box count. 2026-07-06: TORUS is HARD-capped at 6 boxes (physical rigging
+  // limit) — the input simply clamps, no warning dance.
+  const _torusCap = DEFAULT_BOX_TYPES[arr.boxType]?.torus ? 6 : null;
   const countInput = el('input', {
     type: 'number', min: '1', step: '1', value: arr.boxCount,
-    onchange: (e) => onChange('boxCount', Math.max(1, parseInt(e.target.value) || 1))
+    ...(_torusCap ? { max: String(_torusCap) } : {}),
+    onchange: (e) => {
+      let v = Math.max(1, parseInt(e.target.value) || 1);
+      if (_torusCap) v = Math.min(_torusCap, v);
+      onChange('boxCount', v);
+    }
   });
   form.appendChild(field('Box count', countInput));
   if (arr.boxType === 'T12') form.appendChild(field('Hang mix', buildTorusMixField()));
@@ -13463,7 +13492,8 @@ function importD3Proposals() {
       const bt = DEFAULT_BOX_TYPES[p.boxType];
       if (bt && !bt.resolutions.includes(arr.resolution)) arr.resolution = bt.resolutions[0];
       if (bt && bt.defaultAmp) arr.ampType = bt.defaultAmp;
-      if (p.torusModel) arr.torusMix = Array(p.count).fill(p.torusModel);   // 2026-07-06: D3 T1215/T1230 → T12 mix
+      if (bt && bt.torus && arr.boxCount > 6) arr.boxCount = 6;             // hard cap
+      if (p.torusModel) arr.torusMix = Array(Math.min(6, p.count)).fill(p.torusModel);   // 2026-07-06: D3 T1215/T1230 → T12 mix
       arr.d3 = p.d3;
       state.arrays.push(arr);
     } else {
