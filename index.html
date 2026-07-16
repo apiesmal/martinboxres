@@ -5976,6 +5976,43 @@ function calcSubArray(sa) {
         });
       }
     }
+  } else if (!isCastellated && layersPerStack === 3 && arr.layers.filter(l => l === 'B').length === 1) {
+    // === 2026-07-11 (Martijn): cardioid TRIPLE cross-link scheme (F+B+F,
+    // B+F+F, F+F+B — 2× forward + 1× rear per stack). Replaces the flat walk,
+    // which produced cross-stack F links and a per-stack alternating pattern.
+    //   1) The two FORWARD cabs of each stack share one NL4d (short in-stack
+    //      link) — emitted FIRST for every stack, so all F channels sit first
+    //      on each rack (handy: rear/cardioid DSP stays grouped at the end).
+    //   2) The B cabs pair with the NEIGHBOUR stack's B (adjacent link);
+    //      odd stack count → last B on its own NL4d.
+    // Cross-link keeps 1 ch per cab, so DSP is per-cab either way — channel
+    // count is identical to the old walk; only cabling + patch order changed.
+    const _fSubs = result.subList.filter(x => x.orientation !== 'B');
+    const _bSubs = result.subList.filter(x => x.orientation === 'B');
+    for (let st_ = 0; st_ < stackCount; st_++) {
+      const fs_ = _fSubs.filter(x => x.stackIdx === st_);
+      if (!fs_.length) continue;
+      result.pairs.push({
+        pairIdx: result.pairs.length,
+        subs: fs_,
+        trunkType: pairTrunkType,
+        isStockParallel: false,
+        withinStackPair: true,
+        cardioidCrossLinkPerChannel: fs_.length === 2
+      });
+    }
+    for (let i = 0; i < _bSubs.length; i += 2) {
+      const subs = [_bSubs[i]];
+      if (i + 1 < _bSubs.length) subs.push(_bSubs[i + 1]);
+      result.pairs.push({
+        pairIdx: result.pairs.length,
+        subs,
+        trunkType: pairTrunkType,
+        isStockParallel: false,
+        adjacentStackPair: subs.length === 2,
+        cardioidCrossLinkPerChannel: subs.length === 2
+      });
+    }
   } else {
     // Sequential: walk flat, pair every 2.
     for (let i = 0; i < totalSubs; i += 2) {
@@ -7153,29 +7190,36 @@ function calcSubArray(sa) {
       contribChUsed += chPerCab;
     });
   } else {
-    // Sequential: one entry per sub
-    for (let i = 0; i < result.subList.length; i++) {
-      const sub = result.subList[i];
-      const info = resolveAmpFor(1);
-      result.ampPatch.push({
-        groupIdx: i,
-        ampIdx: info.ampIdx,
-        ampKey: info.ampKey,
-        rackId: info.rackId,
-        rackName: info.rackName,
-        ampLabel: info.ampLabel,
-        channelLabel: `ch${info.chWithinAmp}`,
-        boxes: [i + 1],
-        biamp: false,
-        channelsConsumed: 1,
-        orientation: sub.orientation,
-        stackIdx: sub.stackIdx,
-        stackIdxs: [sub.stackIdx],
-        layerIdx: sub.layerIdx,
-        isStockParallel: false
+    // Sequential: one entry per sub. 2026-07-11 (Martijn, cardioid-triple
+    // scheme): walk PAIR ORDER instead of subList order — each NL4d must carry
+    // two CONSECUTIVE amp channels, so channels follow the wiring. For the
+    // legacy flat walk pair order == subList order, so nothing changes there;
+    // for F-pairs-first the F channels now really sit first on each rack.
+    let _seqEmit = 0;
+    result.pairs.forEach(p => {
+      p.subs.forEach(sub => {
+        const i = result.subList.indexOf(sub);
+        const info = resolveAmpFor(1);
+        result.ampPatch.push({
+          groupIdx: _seqEmit++,
+          ampIdx: info.ampIdx,
+          ampKey: info.ampKey,
+          rackId: info.rackId,
+          rackName: info.rackName,
+          ampLabel: info.ampLabel,
+          channelLabel: `ch${info.chWithinAmp}`,
+          boxes: [i + 1],
+          biamp: false,
+          channelsConsumed: 1,
+          orientation: sub.orientation,
+          stackIdx: sub.stackIdx,
+          stackIdxs: [sub.stackIdx],
+          layerIdx: sub.layerIdx,
+          isStockParallel: false
+        });
+        contribChUsed += 1;
       });
-      contribChUsed += 1;
-    }
+    });
   }
 
   return result;
@@ -9857,9 +9901,13 @@ function renderSubDetailedDiagram(sa, calc) {
   // so total IDs = sum of (pair has F+B mix ? 2 : 1) over pairs. Other diagrams
   // still see pd.color / pd.cableId (the "primary" / F-side values), while the
   // new pd.perCh array holds the [F, B] split when the flag is set.
+  // 2026-07-11 (Martijn, cardioid-triple wiring): routing LANES stay sorted by
+  // physical position (untangled drawing), but cable-IDs now follow the WIRING
+  // order (calc.pairs = channel order) — since F-pairs-first the two no longer
+  // coincide, and the badge numbers must match the rack rows top-to-bottom.
+  sortedPairs.forEach((pd, i) => { pd.laneIdx = i; });
   let _cableIdCounter = 0;
-  sortedPairs.forEach((pd, i) => {
-    pd.laneIdx = i;                              // routing lane (1 per physical cable)
+  pairData.forEach(pd => {
     if (pd.pair.cardioidCrossLinkPerChannel && pd.pair.subs.length === 2) {
       const idF = ++_cableIdCounter;             // F-cab (lower layerIdx → first sub) gets lower ID
       const idB = ++_cableIdCounter;             // B-cab gets next ID
@@ -12982,8 +13030,25 @@ function renderTotals() {
    ========================================================================= */
 
 function addArray() {
-  const last = state.arrays[state.arrays.length - 1];
-  const newArr = last ? { ...last, id: 'arr_' + Math.random().toString(36).slice(2,9), name: nextArrayName() } : defaultArray();
+  // 2026-07-10 bugfix (Martijn): '+ Array' used the LAST state.arrays entry as
+  // its template — if that was a FILL SET you got another fill. Template is now
+  // the last real line array. Also: the old shallow spread SHARED rackIds and
+  // all per-rack maps (and torusMix) between template and new array — deep-copy
+  // them like duplicateArray does.
+  const last = [...state.arrays].reverse().find(a => a.kind !== 'fill');
+  const newArr = last ? {
+    ...last,
+    id: 'arr_' + Math.random().toString(36).slice(2, 9),
+    name: nextArrayName(),
+    rackIds: [...(last.rackIds || [])],
+    rackConnectors: { ...(last.rackConnectors || {}) },
+    rackConnectorsFanIn: { ...(last.rackConnectorsFanIn || {}) },
+    rackChannelOverrides: { ...(last.rackChannelOverrides || {}) },
+    rackJackAssignments: { ...(last.rackJackAssignments || {}) },
+    rackDistances: { ...(last.rackDistances || {}) },
+    torusMix: Array.isArray(last.torusMix) ? [...last.torusMix] : []
+  } : defaultArray();
+  delete newArr.ord;   // renumber hangt hem achteraan i.p.v. midden in de lijst
   state.arrays.push(newArr);
   saveState();
   renderAll();
@@ -13694,6 +13759,18 @@ function openD3ImportModal() {
         (p.d3.pos ? ` · pos ${p.d3.pos.x.toFixed(1)}/${p.d3.pos.y.toFixed(1)}/${p.d3.pos.z.toFixed(1)}m` : '');
     }
     row.appendChild(el('span', { style: 'color:var(--text-muted)' }, desc));
+    // 2026-07-10 (Martijn): D3 carries no box resolution (it's an amping choice,
+    // not acoustic data) — pick it per line array right here in the preview.
+    if (p.supported && p.kind === 'line') {
+      const _resAllowed = getResolutionsForType(p.boxType);
+      const _resDefault = _resAllowed.includes(2) ? 2 : _resAllowed[0];
+      const resSel = el('select', {
+        id: 'd3res_' + i,
+        title: 'Box resolution (boxes per amp channel group) — not part of the D3 export',
+        style: 'margin-left:auto;padding:1px 4px;font-size:11.5px;border:1px solid var(--border-strong);background:var(--input-bg);color:var(--text);border-radius:4px'
+      }, ..._resAllowed.map(r => el('option', { value: String(r), selected: r === _resDefault ? '' : null }, r + '-box res')));
+      row.appendChild(resSel);
+    }
     body.appendChild(row);
   });
   document.getElementById('d3ImportModal').classList.remove('hidden');
@@ -13720,6 +13797,8 @@ function importD3Proposals() {
       const arr = defaultArray();
       arr.name = p.name; arr.boxType = p.boxType; arr.boxCount = p.count; arr.mounting = p.mounting;
       const bt = DEFAULT_BOX_TYPES[p.boxType];
+      const _resSel = document.getElementById('d3res_' + i);
+      if (_resSel && parseInt(_resSel.value) > 0) arr.resolution = parseInt(_resSel.value);
       if (bt && !bt.resolutions.includes(arr.resolution)) arr.resolution = bt.resolutions[0];
       if (bt && bt.defaultAmp) arr.ampType = bt.defaultAmp;
       if (bt && bt.torus && arr.boxCount > 6) arr.boxCount = 6;             // hard cap
