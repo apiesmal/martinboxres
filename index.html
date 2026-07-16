@@ -4198,6 +4198,9 @@ function defaultSubArray() {
     rackDistances: {},                  // Phase B 2026-05-31: per-rack tail length override
                                         //   (rackId → metres). Empty entry falls back to ampDistanceM.
     rackArrivals: {},                   // Phase C 2026-05-31: per-rack arrival stack index inside the array.
+    rackSides: {},                      // 2026-07-11 (Martijn): rack position vs the array — 'left'|'center'|'right'.
+                                        // Steers the default arrival AND (left+right present, cross-link) splits the
+                                        // array into halves so each side's rack feeds its own stacks/channels.
                                         //   (rackId → 0-based stackIdx where the trunk physically lands).
                                         //   Empty entry → defaults to middle of array.
     multipinPatchBlock: {},             // Phase D 2026-06-02: per-multipin-variant break-out block toggle.
@@ -4264,7 +4267,7 @@ const _VIEWER_SUB_KEYS = {
   stackCount:'sc', wiringMode:'w', orientation:'o', mirrorOddLayerSingletons:'mo',
   arrayWidthM:'aw', rackIds:'ri', rackConnectors:'rc', rackConnectorsFanIn:'rf',
   rackChannelOverrides:'ro', rackJackAssignments:'rj', rackDistances:'rd',
-  rackArrivals:'ra', multipinPatchBlock:'mp', castellatedPreset:'cp',
+  rackArrivals:'ra', rackSides:'rs', multipinPatchBlock:'mp', castellatedPreset:'cp',
   castellatedElements:'ce', subLoad:'sl', bridge:'br', name:'n'
 };
 const _VIEWER_RACK_KEYS = { id:'i', name:'n', amps:'p', panels:'pn' };
@@ -4331,7 +4334,14 @@ function renderViewerMode(){
   if (nCabs) bits.push(nCabs + ' cabs');
   if (calc && typeof calc.channelsTotal === 'number') bits.push(calc.channelsTotal + ' ch');
   if (bits.length) hdr.appendChild(el('div', { class: 'viewer-sub' }, bits.join(' · ')));
-  hdr.appendChild(el('div', { class: 'viewer-hint' }, '💡 Tap a cable or cab to highlight it · pinch to zoom'));
+  const hintRow = el('div', { class: 'viewer-hint', style: 'display:flex;align-items:center;gap:10px;flex-wrap:wrap' });
+  hintRow.appendChild(el('span', null, '💡 Tap a cable or cab to highlight it · pinch to zoom'));
+  hintRow.appendChild(el('button', {
+    class: 'ghost',
+    style: 'padding:2px 10px;font-size:12px;border:1px solid var(--border-strong);border-radius:6px',
+    onclick: () => { state.settings.detailVertical = !state.settings.detailVertical; renderViewerMode(); }
+  }, state.settings.detailVertical ? '↔ Horizontal layout' : '↕ Vertical layout'));
+  hdr.appendChild(hintRow);
   root.appendChild(hdr);
   const wrap = el('div', { class: 'viewer-svg-wrap' });
   wrap.appendChild(renderSubDetailedDiagram(sa, calc));
@@ -4347,7 +4357,7 @@ function enterViewerMode(payloadStr){
     return true;
   }
   state = buildViewerState(decoded);
-  state.settings.detailVertical = true;   // vertical reads best on a phone
+  state.settings.detailVertical = false;  // 2026-07-11 (Martijn): HORIZONTAL is the phone default now
   window._projectAllocation = computeProjectRackAllocation();
   window._currentDetailKind = 'sub';
   renderViewerMode();
@@ -4520,6 +4530,7 @@ function loadState() {
       if (!sa.rackArrivals || typeof sa.rackArrivals !== 'object') {
         sa.rackArrivals = {};
       }
+      if (!sa.rackSides || typeof sa.rackSides !== 'object') sa.rackSides = {};
       // Phase D 2026-06-02: per-variant patch-block toggle map.
       if (!sa.multipinPatchBlock || typeof sa.multipinPatchBlock !== 'object') {
         sa.multipinPatchBlock = {};
@@ -4743,12 +4754,38 @@ function computeProjectRackAllocation() {
   ];
   items.sort((a, b) => ((a.ref.ord ?? 1e9) - (b.ref.ord ?? 1e9)));
 
+  // 2026-07-11 (Martijn): L/R rack sides on sub arrays cap each side-rack's
+  // claim at ITS half of the channels, so the left rack can't eat the right
+  // half even when it has spare capacity. Only for sequential (cross-link)
+  // non-castellated, non-bridge arrays — mirror schemes span the array by design.
+  const _sideCapFor = (item, rid, sides) => {
+    const a = item.ref;
+    if (item.kind !== 'sub') return Infinity;
+    const side = sides[rid];
+    if (side !== 'left' && side !== 'right') return Infinity;
+    const hasL = (a.rackIds || []).some(r => sides[r] === 'left');
+    const hasR = (a.rackIds || []).some(r => sides[r] === 'right');
+    if (!(hasL && hasR)) return Infinity;
+    const def = DEFAULT_SUB_TYPES[a.boxType];
+    if (!def) return Infinity;
+    const mode = (def.wiringModes || {})[a.wiringMode || def.defaultWiringMode];
+    if (!mode || mode.pairing !== 'sequential') return Infinity;
+    if (a.arrangement === 'castellated') return Infinity;
+    if (a.bridge && def.supportsBridge) return Infinity;
+    const layers = ((SUB_ARRANGEMENTS[a.arrangement] || {}).layers || []).length || 1;
+    const N = Math.max(1, +a.stackCount || 1);
+    const splitAt = Math.ceil(N / 2);
+    return side === 'left' ? layers * splitAt : layers * (N - splitAt);
+  };
+
   items.forEach(item => {
     const arr = item.ref;
     allocation[arr.id] = {};
     const totalCh = item.totalCh;
     if (!totalCh) return;
     let remaining = totalCh;
+    const _sidesAlloc = (item.kind === 'sub' && arr.rackSides) ? arr.rackSides : {};
+    const _sideUsed = { left: 0, right: 0 };
 
     (arr.rackIds || []).forEach(rid => {
       const rack = (state.racks || []).find(r => r.id === rid);
@@ -4771,7 +4808,14 @@ function computeProjectRackAllocation() {
       // How many of those channels can this array actually claim?
       // Cap to remaining need AND to rack capacity from startCh onwards.
       const headroom = Math.max(0, capacity - (startCh - 1));
-      const channels = Math.min(remaining, headroom);
+      let channels = Math.min(remaining, headroom);
+      // 2026-07-11: side-cap — a left/right rack claims at most its half.
+      const _cap = _sideCapFor(item, rid, _sidesAlloc);
+      if (_cap !== Infinity) {
+        const _sd = _sidesAlloc[rid];
+        channels = Math.min(channels, Math.max(0, _cap - (_sideUsed[_sd] || 0)));
+        _sideUsed[_sd] = (_sideUsed[_sd] || 0) + channels;
+      }
       const endCh   = channels > 0 ? startCh + channels - 1 : startCh - 1;
       const overrun = remaining > headroom;   // wanted more from this rack than capacity allows
 
@@ -5976,68 +6020,92 @@ function calcSubArray(sa) {
         });
       }
     }
-  } else if (!isCastellated && layersPerStack === 3 && arr.layers.filter(l => l === 'B').length === 1) {
-    // === 2026-07-11 (Martijn): cardioid TRIPLE cross-link scheme (F+B+F,
-    // B+F+F, F+F+B — 2× forward + 1× rear per stack). Replaces the flat walk,
-    // which produced cross-stack F links and a per-stack alternating pattern.
-    //   1) The two FORWARD cabs of each stack share one NL4d (short in-stack
-    //      link) — emitted FIRST for every stack, so all F channels sit first
-    //      on each rack (handy: rear/cardioid DSP stays grouped at the end).
-    //   2) The B cabs pair with the NEIGHBOUR stack's B (adjacent link);
-    //      odd stack count → last B on its own NL4d.
-    // Cross-link keeps 1 ch per cab, so DSP is per-cab either way — channel
-    // count is identical to the old walk; only cabling + patch order changed.
-    const _fSubs = result.subList.filter(x => x.orientation !== 'B');
-    const _bSubs = result.subList.filter(x => x.orientation === 'B');
-    for (let st_ = 0; st_ < stackCount; st_++) {
-      const fs_ = _fSubs.filter(x => x.stackIdx === st_);
-      if (!fs_.length) continue;
-      result.pairs.push({
-        pairIdx: result.pairs.length,
-        subs: fs_,
-        trunkType: pairTrunkType,
-        isStockParallel: false,
-        withinStackPair: true,
-        cardioidCrossLinkPerChannel: fs_.length === 2
-      });
-    }
-    for (let i = 0; i < _bSubs.length; i += 2) {
-      const subs = [_bSubs[i]];
-      if (i + 1 < _bSubs.length) subs.push(_bSubs[i + 1]);
-      result.pairs.push({
-        pairIdx: result.pairs.length,
-        subs,
-        trunkType: pairTrunkType,
-        isStockParallel: false,
-        adjacentStackPair: subs.length === 2,
-        cardioidCrossLinkPerChannel: subs.length === 2
-      });
-    }
+  } else if (effectivePairing === 'sequential') {
+    // === Sequential (cross-link) pairing =====================================
+    // 2026-07-11 (Martijn): optional L/R SPLIT — when this array has a rack
+    // tagged 'left' AND one tagged 'right' (sa.rackSides), pairing runs PER
+    // HALF: left stacks (1..ceil(N/2)) first, then the right half. Cables never
+    // cross the middle, and with rackIds ordered left→right the left rack's
+    // channel window serves exactly the left half. Without sides: one partition
+    // = exactly the old behaviour.
+    const _sidesMap = sa.rackSides || {};
+    const _lrSplit = (sa.rackIds || []).some(r => _sidesMap[r] === 'left') &&
+                     (sa.rackIds || []).some(r => _sidesMap[r] === 'right') &&
+                     stackCount > 1;
+    const _splitAt = Math.ceil(stackCount / 2);
+    const _partitions = _lrSplit
+      ? [(x) => x.stackIdx < _splitAt, (x) => x.stackIdx >= _splitAt]
+      : [() => true];
+    const _isTriple = !isCastellated && layersPerStack === 3 &&
+                      arr.layers.filter(l => l === 'B').length === 1;
+    _partitions.forEach(inPart => {
+      const partSubs = result.subList.filter(inPart);
+      if (!partSubs.length) return;
+      if (_isTriple) {
+        // === Cardioid TRIPLE cross-link scheme (2026-07-11, Martijn's design:
+        // F+B+F / B+F+F / F+F+B — 2× forward + 1× rear per stack).
+        //   1) the two FORWARD cabs of each stack share one NL4d (short
+        //      in-stack link) — emitted FIRST per stack, so all F channels sit
+        //      first on each rack (rear/cardioid DSP grouped at the end);
+        //   2) the B cabs pair with the NEIGHBOUR stack's B (adjacent link),
+        //      odd count → last B on its own NL4d.
+        // Cross-link keeps 1 ch per cab; channel count equals the old walk.
+        const _fSubs = partSubs.filter(x => x.orientation !== 'B');
+        const _bSubs = partSubs.filter(x => x.orientation === 'B');
+        const _stacksHere = [...new Set(partSubs.map(x => x.stackIdx))].sort((a, b) => a - b);
+        _stacksHere.forEach(st_ => {
+          const fs_ = _fSubs.filter(x => x.stackIdx === st_);
+          if (!fs_.length) return;
+          result.pairs.push({
+            pairIdx: result.pairs.length,
+            subs: fs_,
+            trunkType: pairTrunkType,
+            isStockParallel: false,
+            withinStackPair: true,
+            cardioidCrossLinkPerChannel: fs_.length === 2
+          });
+        });
+        for (let i = 0; i < _bSubs.length; i += 2) {
+          const subs = [_bSubs[i]];
+          if (i + 1 < _bSubs.length) subs.push(_bSubs[i + 1]);
+          result.pairs.push({
+            pairIdx: result.pairs.length,
+            subs,
+            trunkType: pairTrunkType,
+            isStockParallel: false,
+            adjacentStackPair: subs.length === 2,
+            cardioidCrossLinkPerChannel: subs.length === 2
+          });
+        }
+      } else {
+        // Flat walk: pair every 2 within the partition.
+        // Per-channel coloring for pairs that mix layer types (F + B on one
+        // NL4d) or belong to a cardioid/castellated array — see the 2026-06-03
+        // rationale: each cab in such a pair is its own addressable channel,
+        // so it gets its own cable-ID + color; only pure-F SPL-stack clones
+        // keep a shared color.
+        for (let i = 0; i < partSubs.length; i += 2) {
+          const subs = [partSubs[i]];
+          if (i + 1 < partSubs.length) subs.push(partSubs[i + 1]);
+          const cardioidCrossLinkPerChannel = subs.length === 2 && (
+            isCastellated || isCardioid || subs[0].orientation !== subs[1].orientation
+          );
+          result.pairs.push({
+            pairIdx: result.pairs.length,
+            subs,
+            trunkType: pairTrunkType,
+            isStockParallel: false,
+            cardioidCrossLinkPerChannel
+          });
+        }
+      }
+    });
   } else {
-    // Sequential: walk flat, pair every 2.
+    // Fallback (unknown pairing mode): flat walk, pair every 2 — should not
+    // normally be reached; kept as a safety net identical to the legacy walk.
     for (let i = 0; i < totalSubs; i += 2) {
       const subs = [result.subList[i]];
       if (i + 1 < totalSubs) subs.push(result.subList[i + 1]);
-      // 2026-06-03: per-channel coloring for sequential cross-link pairs that
-      // mix layer types (F + B in same NL4d). Argument: F and B serve very
-      // different audio purposes (main vs. cardioid rear cancellation), so
-      // sharing one cable-ID/color visually misleads. Each cab in such a pair
-      // gets its own cable-ID + color in the diagrams, and the rack listing
-      // splits the trunk's row into 2 channel-rows under a bracket.
-      // Detection: 2-sub pair with subs of different `orientation` values
-      // ('F' vs 'B'). F+F (same orientation) keeps shared color — same audio
-      // bedoeling, just SPL stacking. Covers SXH218/SXHF218 F+B/F+B+F, SX218
-      // modded F+B/F+B+F, SX218+ F+B/F+B+F. Cross-stack F+F pairs in F+B+F
-      // (the middle pair walking layer 2 of stack k with layer 0 of stack k+1)
-      // are NOW also split when the ARRAY is cardioid (isCardioid below): in a
-      // cardioid array every cab is its own addressable channel. Only pure-F arrays
-      // (F / F+F / F+F+F, no B) keep F+F combined as genuine SPL-stacked clones.
-      //
-      // EXCEPTION (2026-06-03): castellated mode ALWAYS per-channel for 2-cab
-      // pairs. In castellated, every cab is in its own unique stack position —
-      // even "F+F" cross-stack pairs (S-stack F looped through to T-stack F) are
-      // functionally distinct cabs covering different array positions, NOT
-      // SPL-stacked clones. Shared color would falsely imply equivalence.
       const cardioidCrossLinkPerChannel = subs.length === 2 && (
         isCastellated || isCardioid || subs[0].orientation !== subs[1].orientation
       );
@@ -6478,9 +6546,20 @@ function calcSubArray(sa) {
   const _cabXTail = (_isPortraitTail ? _ldTail.h : _ldTail.w) / 1000 || 0;
   const _centersValTail = (result.geometry && result.geometry.centers > 0) ? result.geometry.centers : null;
   const _midStackTail = Math.floor(Math.max(0, stackCount - 1) / 2);
+  // 2026-07-11: rack side ('left'/'center'/'right') supplies the default arrival
+  // when no manual stack is pinned — left rack lands at stack 1, right at stack N.
+  const _sideArrivalOf = (rid) => {
+    const side = (sa.rackSides || {})[rid];
+    if (side === 'left') return 0;
+    if (side === 'right') return Math.max(0, stackCount - 1);
+    if (side === 'center') return Math.floor(Math.max(0, stackCount - 1) / 2);
+    return null;
+  };
   const _getArrivalStackTail = (rid) => {
     const v = (sa.rackArrivals && Number.isInteger(sa.rackArrivals[rid])) ? sa.rackArrivals[rid] : null;
     if (v != null && v >= 0 && v < stackCount) return v;
+    const sv_ = _sideArrivalOf(rid);
+    if (sv_ != null) return sv_;
     return _midStackTail;
   };
   // Per-multipin natural landing: where THIS multipin physically lands
@@ -6724,6 +6803,8 @@ function calcSubArray(sa) {
       const getArrivalStack = (rid) => {
         const v = (sa.rackArrivals && Number.isInteger(sa.rackArrivals[rid])) ? sa.rackArrivals[rid] : null;
         if (v != null && v >= 0 && v < stackCount) return v;
+        const sv_ = _sideArrivalOf(rid);   // 2026-07-11: side-based default
+        if (sv_ != null) return sv_;
         return midStack;
       };
       // Build pair → multipin trunk (+ its index), so we know which pairs to emit
@@ -8667,6 +8748,42 @@ function renderSubArrayCard(sa, idx) {
       // lengths stay short/accurate. This picker is an OPTIONAL override that
       // pins the WHOLE rack to one arrival stack (e.g. a single shared cable
       // entry point for a small ground-stack). Most arrays leave it on auto.
+      // 2026-07-11 (Martijn): rack POSITION vs the array — left / center / right.
+      // Steers the default cable-arrival point, and with a left + a right rack a
+      // cross-link array splits into halves (left rack feeds the left stacks).
+      // Setting a side re-orders sa.rackIds left→center→right so the channel
+      // allocation follows the geometry.
+      {
+        const curSide = (sa.rackSides || {})[rid] || '';
+        const sideSel = el('select', {
+          class: 'rack-chip-detail',
+          title: 'Rack position relative to the sub array.\nLeft/right rack pair splits a cross-link array into halves: each rack feeds its own side (cables + channels).\nAlso sets the default arrival point (left = stack 1, right = last stack).',
+          style: 'padding:1px 4px;font-size:10.5px;border:1px solid var(--border-strong);background:var(--input-bg);color:var(--text);border-radius:4px',
+          onchange: (e) => {
+            const v = e.target.value;
+            const next = { ...(sa.rackSides || {}) };
+            if (!v) delete next[rid];
+            else next[rid] = v;
+            sa.rackSides = next;
+            // 2026-07-11 fix (Martijn): only re-order the racks once BOTH a
+            // left and a right rack exist (that's when order drives the L/R
+            // split). Sorting on every change made the chip jump to the front,
+            // which read as "the first rack got my value".
+            const _hasL = (sa.rackIds || []).some(id => next[id] === 'left');
+            const _hasR = (sa.rackIds || []).some(id => next[id] === 'right');
+            if (_hasL && _hasR) {
+              const _rank = (id) => ({ left: 0, center: 1, right: 2 })[next[id]] ?? 1;
+              sa.rackIds = [...(sa.rackIds || [])].sort((a, b) => _rank(a) - _rank(b));
+            }
+            onChange('rackSides', next);
+          }
+        },
+          el('option', { value: '', selected: curSide === '' ? '' : null }, 'pos: auto'),
+          el('option', { value: 'left', selected: curSide === 'left' ? '' : null }, 'left of array'),
+          el('option', { value: 'center', selected: curSide === 'center' ? '' : null }, 'center'),
+          el('option', { value: 'right', selected: curSide === 'right' ? '' : null }, 'right of array'));
+        chip.appendChild(sideSel);
+      }
       if (sa.stackCount > 0) {
         const curArrival = (sa.rackArrivals && Number.isInteger(sa.rackArrivals[rid])) ? sa.rackArrivals[rid] : null;
         const arrivalSel = el('select', {
@@ -13057,7 +13174,9 @@ function addArray() {
 function nextArrayName() {
   // Suggest based on existing names
   const names = state.arrays.map(a => a.name);
-  const candidates = ['Main L', 'Main R', 'Outfill L', 'Outfill R', 'Infill L', 'Infill R', 'Frontfill', 'Delay L', 'Delay R'];
+  // 2026-07-11: 'Frontfill' removed from the candidates — fills are their own
+  // card type now, and a LINE array named 'Frontfill' reads like a fill set.
+  const candidates = ['Main L', 'Main R', 'Outfill L', 'Outfill R', 'Infill L', 'Infill R', 'Delay L', 'Delay R'];
   for (const c of candidates) if (!names.includes(c)) return c;
   return 'Array ' + (state.arrays.length + 1);
 }
@@ -13146,6 +13265,7 @@ function duplicateSubArray(idx) {
     rackJackAssignments: { ...(orig.rackJackAssignments || {}) },
     rackDistances: { ...(orig.rackDistances || {}) },
     rackArrivals: { ...(orig.rackArrivals || {}) },
+    rackSides: { ...(orig.rackSides || {}) },
     multipinPatchBlock: { ...(orig.multipinPatchBlock || {}) }
   };
   copy.ord = (typeof orig.ord === 'number' ? orig.ord : 0) + 0.5;   // direct na origineel in de merged volgorde
