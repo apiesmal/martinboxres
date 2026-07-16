@@ -13516,16 +13516,41 @@ function _rackCapacityFor(rack, ampType) {
    state.racks order); reassignAll = also redo arrays that already have racks.
    Returns { entries: [{arr, kindLabel, need, rackIds, got, kept}], leftover }. */
 function buildAutoAssignPlan(selectedIds, reassignAll) {
+  // === v2 (2026-07-12, Martijn: "hij maakt domme fouten") ====================
+  // 1) WHOLE-ARRAY-FIRST: prefer a single rack that fits the entire need,
+  //    best-fit (smallest fitting rack) so big racks stay free for big arrays;
+  //    only split when nothing fits whole (then largest-remaining first =
+  //    fewest racks).
+  // 2) STEREO SYMMETRY: "… L" / "… R" partners (same base name, ampType and
+  //    need) avoid each other's racks when an equivalent alternative exists.
+  // 3) PANEL-AWARE (soft): racks lacking the panel types this array's
+  //    connector picks require are deprioritised; if unavoidable the plan
+  //    shows a ⚠ note instead of failing after Apply.
+  // 4) RACK SIDES: a sub array split over exactly two racks gets
+  //    rackSides = left/right automatically (Apply), so cabling + channel
+  //    split follow the geometry out of the box.
   const selected = (state.racks || []).filter(r => selectedIds.includes(r.id));
-  // remaining capacity per (rackId, ampType) — amps of different types are
-  // independent hardware, so capacity is tracked per type.
   const usedKey = (rid, at) => rid + '|' + at;
   const used = {};
+  const remFor = (rack, at) => Math.max(0, _rackCapacityFor(rack, at) - (used[usedKey(rack.id, at)] || 0));
+  // Which panel keys does this array's connector mix need (only explicit picks)?
+  const _panelOk = (rack, a) => {
+    const mix = a.rackConnectors || {};
+    const wanted = Object.keys(mix).filter(k => (mix[k] || 0) > 0)
+      .map(k => (CONNECTOR_TYPES[k] || {}).panelKey).filter(Boolean);
+    if (!wanted.length) {
+      // No picks: subs default to direct NL4 — the rack should have SOME NL4 jacks.
+      if (a.kind === 'sub') return (((rack.panels || {}).nl4_dual || 0) + ((rack.panels || {}).nl4_single || 0)) > 0;
+      return true;
+    }
+    return wanted.every(pk => ((rack.panels || {})[pk] || 0) > 0);
+  };
   const items = [
     ...(state.arrays || []).map(a => ({ arr: a, kindLabel: a.kind === 'fill' ? 'fill set' : 'line array' })),
     ...(state.subArrays || []).map(a => ({ arr: a, kindLabel: 'sub array' }))
   ];
-  // Pass 1: arrays that KEEP their assignment consume capacity first.
+  items.sort((a, b) => ((a.arr.ord ?? 1e9) - (b.arr.ord ?? 1e9)));   // unified card order
+  // Pass 1: kept arrays consume their racks' capacity first.
   items.forEach(it => {
     const a = it.arr;
     it.need = _arrayChannelNeed(a);
@@ -13535,31 +13560,81 @@ function buildAutoAssignPlan(selectedIds, reassignAll) {
     (a.rackIds || []).forEach(rid => {
       const rack = (state.racks || []).find(r => r.id === rid);
       if (!rack || remaining <= 0) return;
-      const k = usedKey(rid, a.ampType);
-      const free = Math.max(0, _rackCapacityFor(rack, a.ampType) - (used[k] || 0));
-      const take = Math.min(free, remaining);
-      used[k] = (used[k] || 0) + take;
+      const take = Math.min(remFor(rack, a.ampType), remaining);
+      used[usedKey(rid, a.ampType)] = (used[usedKey(rid, a.ampType)] || 0) + take;
       remaining -= take;
     });
-    it.keptGot = it.need - remaining;   // shortfall on kept arrays shows in the preview
+    it.keptGot = it.need - remaining;
   });
-  // Pass 2: greedy assignment for the rest, racks in selection order.
+  // Stereo partners: same base name + ampType + need.
+  const _stereoBase = (n) => {
+    const m = String(n || '').trim().match(/^(.*?)[\s_-]+(L|R|Left|Right|Links|Rechts)$/i);
+    return m ? m[1].trim().toLowerCase() : null;
+  };
+  const partnerOf = new Map();
+  const toAssign = items.filter(it => !it.kept && it.need > 0);
+  toAssign.forEach(it => {
+    const b = _stereoBase(it.arr.name);
+    if (!b) return;
+    const other = toAssign.find(o => o !== it && _stereoBase(o.arr.name) === b &&
+      o.arr.ampType === it.arr.ampType && o.need === it.need);
+    if (other) partnerOf.set(it, other);
+  });
+  // Pass 2: assign.
   items.forEach(it => {
     const a = it.arr;
     if (it.kept) { it.rackIds = [...(a.rackIds || [])]; it.got = it.keptGot != null ? it.keptGot : it.need; return; }
     it.rackIds = [];
+    it.notes = [];
+    if (!it.need) { it.got = 0; return; }
+    const avoid = new Set();
+    const partner = partnerOf.get(it);
+    if (partner && Array.isArray(partner.rackIds)) partner.rackIds.forEach(id => avoid.add(id));
+    const pool = () => selected
+      .map(rack => ({ rack, rem: remFor(rack, a.ampType), pok: _panelOk(rack, a) }))
+      .filter(p => p.rem > 0);
+    // (1) whole-array single rack, best-fit.
+    const pickSingle = () => {
+      let cands = pool().filter(p => p.rem >= it.need);
+      if (!cands.length) return null;
+      const tiers = [
+        cands.filter(p => p.pok && !avoid.has(p.rack.id)),
+        cands.filter(p => p.pok),
+        cands.filter(p => !avoid.has(p.rack.id)),
+        cands
+      ];
+      const tier = tiers.find(t => t.length);
+      tier.sort((x, y) => x.rem - y.rem);          // best-fit: kleinste passende
+      return tier[0];
+    };
+    const single = pickSingle();
+    if (single) {
+      used[usedKey(single.rack.id, a.ampType)] = (used[usedKey(single.rack.id, a.ampType)] || 0) + it.need;
+      it.rackIds = [single.rack.id];
+      it.got = it.need;
+      if (!single.pok) it.notes.push('rack mist panel-poorten voor de gekozen connectors');
+      return;
+    }
+    // Split: fewest racks — largest remaining first (panel-ok + non-partner eerst).
     let remaining = it.need;
-    selected.forEach(rack => {
+    const ordered = pool().sort((x, y) =>
+      ((y.pok ? 1 : 0) - (x.pok ? 1 : 0)) ||
+      ((avoid.has(x.rack.id) ? 1 : 0) - (avoid.has(y.rack.id) ? 1 : 0)) ||
+      (y.rem - x.rem));
+    ordered.forEach(p => {
       if (remaining <= 0) return;
-      const k = usedKey(rack.id, a.ampType);
-      const free = Math.max(0, _rackCapacityFor(rack, a.ampType) - (used[k] || 0));
-      if (free <= 0) return;
-      const take = Math.min(free, remaining);
-      used[k] = (used[k] || 0) + take;
+      const take = Math.min(p.rem, remaining);
+      if (take <= 0) return;
+      used[usedKey(p.rack.id, a.ampType)] = (used[usedKey(p.rack.id, a.ampType)] || 0) + take;
       remaining -= take;
-      it.rackIds.push(rack.id);
+      it.rackIds.push(p.rack.id);
+      if (!p.pok) it.notes.push(`${p.rack.name}: mist panel-poorten voor de gekozen connectors`);
     });
     it.got = it.need - remaining;
+    // (4) sub over exactly 2 racks → tag left/right in the plan (applied on Apply).
+    if (it.kindLabel === 'sub array' && it.rackIds.length === 2) {
+      it.autoSides = { [it.rackIds[0]]: 'left', [it.rackIds[1]]: 'right' };
+    }
   });
   return { entries: items, selected };
 }
@@ -13601,11 +13676,16 @@ function renderAutoAssignModal(keepSelection) {
   prev.appendChild(el('h3', { style: 'margin:0 0 6px;font-size:13px' }, 'Plan'));
   plan.entries.forEach(it => {
     if (!it.need) return;
-    const names = it.rackIds.map(rid => ((state.racks || []).find(r => r.id === rid) || {}).name).filter(Boolean).join(' + ');
+    const names = it.rackIds.map(rid => {
+      const nm = (((state.racks || []).find(r => r.id === rid)) || {}).name;
+      const side = it.autoSides && it.autoSides[rid] ? ` (${it.autoSides[rid]})` : '';
+      return nm ? nm + side : null;
+    }).filter(Boolean).join(' + ');
     const ok = it.got >= it.need;
-    prev.appendChild(el('div', { style: `font-size:12.5px;padding:2px 0;color:${ok ? 'var(--text)' : 'var(--warn,#e0a030)'}` },
+    const noteTxt = (it.notes && it.notes.length) ? ' ⚠ ' + [...new Set(it.notes)].join('; ') : '';
+    prev.appendChild(el('div', { style: `font-size:12.5px;padding:2px 0;color:${(ok && !noteTxt) ? 'var(--text)' : 'var(--warn,#e0a030)'}` },
       `${it.kept ? '🔒 ' : ''}${it.arr.name} (${it.kindLabel}, ${it.need} ch) → ${names || '—'}` +
-      (ok ? '' : ` ⚠ ${it.need - it.got} ch unplaced`) + (it.kept ? ' (kept)' : '')));
+      (ok ? '' : ` ⚠ ${it.need - it.got} ch unplaced`) + noteTxt + (it.kept ? ' (kept)' : '')));
   });
   body.appendChild(prev);
 }
@@ -13624,6 +13704,15 @@ function applyAutoAssign() {
     if (it.kept || !it.need) return;
     it.arr.rackIds = [...it.rackIds];
     it.arr.rackChannelOverrides = {};   // fresh auto ordering — manual overrides would fight it
+    // 2026-07-12: sub over 2 racks → left/right automatisch; anders stale sides opruimen.
+    if (it.arr.kind === 'sub') {
+      if (it.autoSides) it.arr.rackSides = { ...it.autoSides };
+      else if (it.arr.rackSides) {
+        const keep = {};
+        it.rackIds.forEach(rid => { if (it.arr.rackSides[rid]) keep[rid] = it.arr.rackSides[rid]; });
+        it.arr.rackSides = keep;
+      }
+    }
     n++;
   });
   closeAutoAssign();
